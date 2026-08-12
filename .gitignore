@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+
+# Virtual environments
+.venv*/
+venv/
+
+# CDK / build artifacts
+cdk.out/
+node_modules/
+dist/
+build/
+*.tar.gz
+*.zip
+
+# Data (regenerate via scripts/download_bccd.py). Root-anchored: a bare
+# "data/" pattern would also exclude src/data/ and silently drop pipeline
+# source files from the repository.
+/data/
+
+# Local temp / scratch
+tmp/
+.tmp/
+.tmp*
+
+# Notebook noise
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Session / agent artifacts
+session_status/
+.kiro/
+SESSION_*_HANDOFF.md
+THOUGHT_LOG.md
+PLAN.md
+SESSION_HANDOFF.md

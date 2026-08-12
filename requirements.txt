@@ -1,0 +1,13 @@
+# CDK stack + pipeline synthesis
+aws-cdk-lib>=2.100.0
+constructs>=10.0.0
+sagemaker>=3.0.0,<4
+boto3>=1.26.0
+
+# Scripts + notebooks (data prep, ONNX inference, visualization)
+pillow>=10.0.0
+numpy>=1.24.0,<2
+onnxruntime>=1.16.0
+matplotlib>=3.7.0
+# Safe XML parsing for the BCCD VOC annotations (untrusted third-party data)
+defusedxml>=0.7.1
