@@ -24,9 +24,9 @@ from config import (  # noqa: E402
 )
 
 
-# SQS MessageDeduplicationId: up to 128 characters of alphanumerics and punctuation.
+# SQS MessageDeduplicationId: 1-128 printable ASCII characters, excluding space.
 SQS_DEDUP_ID_MAX = 128
-_SQS_DEDUP_SAFE = re.compile(r"^[A-Za-z0-9!-~]{1,128}$")
+_SQS_DEDUP_SAFE = re.compile(r"^[\x21-\x7e]{1,128}$")
 _SQS_UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
 
 
