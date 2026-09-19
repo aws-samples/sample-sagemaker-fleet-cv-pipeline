@@ -17,14 +17,25 @@ def extract_tarball(tar_path: Path, output_dir: Path):
 
 
 def extract_tarballs(channel_dir: Path, split_name: str) -> Path:
-    """Extract SageMaker channel tarballs and return the resolved split directory."""
+    'Extract SageMaker channel tarballs and return the resolved split directory.'
     channel_dir.mkdir(parents=True, exist_ok=True)
 
     split_dir_in_channel = channel_dir / split_name
     if split_dir_in_channel.exists():
         return split_dir_in_channel
 
-    tar_candidates = list(channel_dir.rglob("*.tar.gz")) + list(channel_dir.rglob("*.tgz"))
+    tar_candidates = sorted(
+        list(channel_dir.rglob("*.tar.gz")) + list(channel_dir.rglob("*.tgz"))
+    )
+    if len(tar_candidates) > 1:
+        names = ", ".join(str(p.relative_to(channel_dir)) for p in tar_candidates)
+        raise ValueError(
+            f"Channel {channel_dir} contains {len(tar_candidates)} archives "
+            f"({names}), so which dataset to train on is ambiguous. Selecting one "
+            f"by filesystem order would train on data the caller did not choose. "
+            f"Supply exactly one archive per channel."
+        )
+
     for tar_path in tar_candidates:
         extract_target = channel_dir / f"extracted_{split_name}"
         extract_target.mkdir(parents=True, exist_ok=True)

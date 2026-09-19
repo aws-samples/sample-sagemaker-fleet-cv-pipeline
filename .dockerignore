@@ -1,0 +1,12 @@
+.git
+.venv*
+venv
+cdk.out
+data
+tests
+notebooks
+**/__pycache__
+**/*.pyc
+**/.DS_Store
+.training-image-digest
+execution*.json

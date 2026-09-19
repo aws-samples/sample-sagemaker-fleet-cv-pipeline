@@ -1,0 +1,59 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+name: offline-checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      AWS_EC2_METADATA_DISABLED: "true"
+      AWS_REGION: us-east-1
+      AWS_DEFAULT_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install the documented dependency set
+        run: |
+          python -m pip install -r requirements-dev.txt -c constraints-tested.txt \
+            --extra-index-url https://download.pytorch.org/whl/cpu
+          python -m pip check
+      - name: Lint
+        run: python -m pyflakes app.py aws_env.py config.py orchestration_stack.py sagemaker_cv_pipeline_stack.py src scripts tests docker
+      - name: Offline tests
+        run: |
+          set -o pipefail
+          python -m pytest tests/ -m "not integration" -q --strict-markers | tee result.txt
+          if grep -qE '[0-9]+ skipped' result.txt; then exit 1; fi
+      - name: Local lifecycle
+        run: python scripts/smoke_local.py
+  training-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/training/Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: fleetcv-training:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Lifecycle inside the training image
+        run: |
+          docker run --rm --network none --entrypoint python \
+            -v "$PWD:/workspace:ro" -w /workspace \
+            fleetcv-training:ci scripts/smoke_local.py

@@ -4,6 +4,7 @@
 
 
 import json
+import boto3
 from aws_cdk import (
     Stack,
     aws_sagemaker as sm,
@@ -18,26 +19,28 @@ from sagemaker.train import ModelTrainer
 from sagemaker.train.configs import InputData, Compute, OutputDataConfig
 from sagemaker.core.training.configs import MetricDefinition
 from sagemaker.core.processing import ScriptProcessor
-from sagemaker.serve.model_builder import ModelBuilder
 from sagemaker.core.model_metrics import ModelMetrics, MetricsSource
 from sagemaker.core.shapes import ProcessingOutput, ProcessingS3Output, ProcessingInput, ProcessingS3Input
 from sagemaker.core.workflow.execution_variables import ExecutionVariables
 from sagemaker.core.workflow.functions import Join
 from sagemaker.core.workflow.parameters import ParameterFloat, ParameterInteger, ParameterString
-from sagemaker.mlops.workflow.pipeline import Pipeline
-from sagemaker.mlops.workflow.steps import ProcessingStep, CacheConfig, TrainingStep
-from sagemaker.mlops.workflow.model_step import ModelStep
-from sagemaker.mlops.workflow.condition_step import ConditionStep
-from sagemaker.mlops.workflow.fail_step import FailStep
 from sagemaker.core.workflow.conditions import ConditionGreaterThanOrEqualTo
 from sagemaker.core.workflow.functions import JsonGet
 from sagemaker.core.workflow.properties import PropertyFile
 from sagemaker.core.workflow.pipeline_context import PipelineSession
-from sagemaker.core.helper.session_helper import Session
-from sagemaker.core import image_uris
 
-PIPELINE_NAME = "anomaly-detection-pipeline-e2e-final"
-
+import config
+from config import (
+    ANOMALY_MODEL_GROUP,
+    CLASSIFIER_MODEL_GROUP,
+    OUTPUT_BUCKET_NAME,
+    OUTPUT_EXECUTION_ROLE_ARN,
+    OUTPUT_PIPELINE_NAME,
+    OUTPUT_TRAINING_REPO_URI,
+    PIPELINE_NAME,
+    RUNS_PREFIX,
+    TRAINING_REPO_NAME,
+)
 
 class SageMakerCVPipelineStack(Stack):
 
@@ -49,7 +52,7 @@ class SageMakerCVPipelineStack(Stack):
         self.training_repo = ecr.Repository(
             self,
             "CustomTrainingRepo",
-            repository_name="sm1k-custom-training",
+            repository_name=TRAINING_REPO_NAME,
             image_scan_on_push=True,
             removal_policy=RemovalPolicy.DESTROY,
             empty_on_delete=True,
@@ -59,27 +62,23 @@ class SageMakerCVPipelineStack(Stack):
         self.anomaly_model_group = sm.CfnModelPackageGroup(
             self,
             "AnomalyModelPackageGroup",
-            model_package_group_name="sm1k-anomaly-model-group",
-            model_package_group_description="sm1k anomaly detection model packages (ONNX)",
+            model_package_group_name=ANOMALY_MODEL_GROUP,
+            model_package_group_description="fleet-cv anomaly detection model packages (ONNX)",
         )
 
         self.classifier_model_group = sm.CfnModelPackageGroup(
             self,
             "ClassifierModelPackageGroup",
-            model_package_group_name="sm1k-classifier-model-group",
-            model_package_group_description="sm1k defect classifier model packages (ONNX)",
+            model_package_group_name=CLASSIFIER_MODEL_GROUP,
+            model_package_group_description="fleet-cv defect classifier model packages (ONNX)",
         )
 
-        # Create S3 bucket for pipeline artifacts
+        # Create S3 bucket for pipeline artifacts. See config.bucket_name for why
+        # the name is account- and region-qualified (uniqueness, not secrecy).
         self.pipeline_bucket = s3.Bucket(
             self,
             "CVPipelineBucket",
-            # Squatting note: the reserved amzn-s3-demo- example prefix cannot
-            # be used here -- S3 rejects CreateBucket for it (verified), and
-            # this stack must actually deploy. The account ID + region suffix
-            # serves the same purpose for deployable code: the name is unique
-            # per deployer and not predictable without knowing their account.
-            bucket_name=f"sagemaker-cv-pipeline-{self.account}-{self.region}",
+            bucket_name=config.bucket_name(self.account, self.region),
             removal_policy=RemovalPolicy.DESTROY,
             auto_delete_objects=True,
             versioned=True,
@@ -88,21 +87,17 @@ class SageMakerCVPipelineStack(Stack):
             enforce_ssl=True,
         )
 
-        # SageMaker execution role for processing/training and registry operations.
-        # In a brand-new account, this must be created (do not assume pre-existing IAM roles).
-        # Permissions are least-privilege inline policies scoped to the resources
-        # this stack deploys (pipeline bucket, training repo, model package groups).
         stack = Stack.of(self)
         # Region-qualified: IAM role names are account-global, so a fixed name
         # blocks deploying this stack to a second region in the same account.
-        role_name = f"SageMakerV3PipelineRole-{stack.region}"
+        role_name = config.execution_role_name(stack.region)
         model_group_arns = [
-            f"arn:aws:sagemaker:{stack.region}:{stack.account}:model-package-group/sm1k-anomaly-model-group",
-            f"arn:aws:sagemaker:{stack.region}:{stack.account}:model-package-group/sm1k-classifier-model-group",
+            f"arn:aws:sagemaker:{stack.region}:{stack.account}:model-package-group/{ANOMALY_MODEL_GROUP}",
+            f"arn:aws:sagemaker:{stack.region}:{stack.account}:model-package-group/{CLASSIFIER_MODEL_GROUP}",
         ]
         model_package_arns = [
-            f"arn:aws:sagemaker:{stack.region}:{stack.account}:model-package/sm1k-anomaly-model-group/*",
-            f"arn:aws:sagemaker:{stack.region}:{stack.account}:model-package/sm1k-classifier-model-group/*",
+            f"arn:aws:sagemaker:{stack.region}:{stack.account}:model-package/{ANOMALY_MODEL_GROUP}/*",
+            f"arn:aws:sagemaker:{stack.region}:{stack.account}:model-package/{CLASSIFIER_MODEL_GROUP}/*",
         ]
         self.sagemaker_role = iam.Role(
             self,
@@ -142,15 +137,32 @@ class SageMakerCVPipelineStack(Stack):
                         ),
                     ]
                 ),
-                # Training jobs require these actions on all resources: CloudWatch
-                # metrics and EC2 network interfaces cannot be resource-scoped, and
-                # the SageMaker SDK v3 role validator simulates ECR pull actions
-                # without a resource ARN, so repo-scoped grants alone fail validation.
                 "SageMakerTrainingRuntime": iam.PolicyDocument(
                     statements=[
+                        # Image pull IS resource-scopeable: this role only ever pulls
+                        # the one image this stack builds.
                         iam.PolicyStatement(
                             actions=[
-                                "cloudwatch:PutMetricData",
+                                "ecr:BatchCheckLayerAvailability",
+                                "ecr:BatchGetImage",
+                                "ecr:GetDownloadUrlForLayer",
+                            ],
+                            resources=[self.training_repo.repository_arn],
+                        ),
+                        iam.PolicyStatement(
+                            actions=["cloudwatch:PutMetricData"],
+                            resources=["*"],
+                            conditions={
+                                "StringEqualsIfExists": {
+                                    "cloudwatch:namespace": [
+                                        "/aws/sagemaker/TrainingJobs",
+                                        "/aws/sagemaker/ProcessingJobs",
+                                    ]
+                                }
+                            },
+                        ),
+                        iam.PolicyStatement(
+                            actions=[
                                 "ec2:CreateNetworkInterface",
                                 "ec2:CreateNetworkInterfacePermission",
                                 "ec2:DeleteNetworkInterface",
@@ -160,9 +172,6 @@ class SageMakerCVPipelineStack(Stack):
                                 "ec2:DescribeSecurityGroups",
                                 "ec2:DescribeSubnets",
                                 "ec2:DescribeVpcs",
-                                "ecr:BatchCheckLayerAvailability",
-                                "ecr:BatchGetImage",
-                                "ecr:GetDownloadUrlForLayer",
                             ],
                             resources=["*"],
                         ),
@@ -255,17 +264,10 @@ class SageMakerCVPipelineStack(Stack):
             },
         )
 
-        # Building the pipeline definition constructs SageMaker SDK v3 objects
-        # (ModelTrainer, processors), and the SDK validates the execution role
-        # against live IAM at that moment. On the FIRST deploy to a fresh
-        # account/region the role does not exist yet, so synthesis fails before
-        # CDK can create it. Bootstrap first, then deploy the pipeline:
-        #
-        #   cdk deploy SageMakerCVPipelineStack -c bootstrap=true
-        #   cdk deploy --all
-        bootstrap_only = self.node.try_get_context("bootstrap")
-        if not bootstrap_only:
-            pipeline_definition = self._create_cv_pipeline_definition()
+        if not config.bootstrap_only(self.node.try_get_context("bootstrap")):
+            pipeline_definition = self._create_cv_pipeline_definition(
+                account=self.account, region=self.region
+            )
 
             self.pipeline = sm.CfnPipeline(
                 self,
@@ -274,37 +276,53 @@ class SageMakerCVPipelineStack(Stack):
                 pipeline_definition={"PipelineDefinitionBody": pipeline_definition},
                 role_arn=self.sagemaker_role.role_arn,
             )
-            CfnOutput(self, "CVPipelineName", value=self.pipeline.pipeline_name)
+            CfnOutput(self, OUTPUT_PIPELINE_NAME, value=self.pipeline.pipeline_name)
 
         # Outputs
-        CfnOutput(self, "CVBucketName", value=self.pipeline_bucket.bucket_name)
-        CfnOutput(self, "CVExecutionRoleArn", value=self.sagemaker_role.role_arn)
-        CfnOutput(self, "CustomTrainingRepoUri", value=self.training_repo.repository_uri)
+        CfnOutput(self, OUTPUT_BUCKET_NAME, value=self.pipeline_bucket.bucket_name)
+        CfnOutput(self, OUTPUT_EXECUTION_ROLE_ARN, value=self.sagemaker_role.role_arn)
+        CfnOutput(self, OUTPUT_TRAINING_REPO_URI, value=self.training_repo.repository_uri)
 
-    def _create_cv_pipeline_definition(self) -> str:
+    def _create_cv_pipeline_definition(self, account: str, region: str) -> str:
+        # Deliberately local: see "NOTE ON IMPORT SAFETY" at the top of this file.
+        # These two modules build boto3 clients at import time, so they must not be
+        # reached by the bootstrap deploy or by any offline test.
+        from sagemaker.mlops.workflow.condition_step import ConditionStep  # noqa: PLC0415
+        from sagemaker.mlops.workflow.fail_step import FailStep  # noqa: PLC0415
+        from sagemaker.mlops.workflow.model_step import ModelStep  # noqa: PLC0415
+        from sagemaker.mlops.workflow.pipeline import Pipeline  # noqa: PLC0415
+        from sagemaker.mlops.workflow.steps import (  # noqa: PLC0415
+            CacheConfig,
+            ProcessingStep,
+            TrainingStep,
+        )
+        from sagemaker.serve.model_builder import ModelBuilder  # noqa: PLC0415
 
-        # Create SageMaker session for pipeline definition
-        sagemaker_session = Session()
 
-        # Use concrete region for image URI retrieval during synthesis
-        concrete_region = sagemaker_session.boto_region_name
+        for label, value in (("account", account), ("region", region)):
+            if not isinstance(value, str) or "${Token" in value or not value:
+                raise ValueError(
+                    f"Unresolved {label} ({value!r}) while building the pipeline "
+                    "definition. Construct the stack with an explicit environment, "
+                    "e.g. SageMakerCVPipelineStack(app, name, "
+                    "env=cdk.Environment(account=..., region=...)); app.py does "
+                    "this by resolving both once. Without it the definition would "
+                    "embed a CDK token in the execution role ARN."
+                )
+
+        boto_session = boto3.session.Session(region_name=region)
+        concrete_region = region
         # IMPORTANT: Use a concrete role ARN string in the pipeline definition.
         # If we pass a CDK token here (from a Role construct), SageMaker SDK may attempt to
         # resolve it via IAM APIs during synthesis and fail.
-        role_arn = (
-            f"arn:aws:iam::{sagemaker_session.account_id()}:role/"
-            f"SageMakerV3PipelineRole-{concrete_region}"
+        role_arn = f"arn:aws:iam::{account}:role/{config.execution_role_name(region)}"
+
+        # Concrete bucket name, identical to the CDK bucket above.
+        bucket_name = config.bucket_name(account, region)
+
+        pipeline_session = PipelineSession(
+            boto_session=boto_session, default_bucket=bucket_name
         )
-
-        # Use concrete bucket name for pipeline definition. Must match the
-        # CDK bucket above (see squatting note there).
-        bucket_name = f"sagemaker-cv-pipeline-{sagemaker_session.account_id()}-{concrete_region}"
-
-        # Route ALL SDK-managed uploads (step code, packaged artifacts) to the
-        # pipeline bucket. Without this the SDK uploads step scripts to its
-        # default bucket (sagemaker-<region>-<account>), which the execution
-        # role deliberately cannot read: jobs then fail at CreateProcessingJob.
-        pipeline_session = PipelineSession(default_bucket=bucket_name)
 
         # Pipeline parameters
         training_instance_type = ParameterString(
@@ -313,33 +331,24 @@ class SageMakerCVPipelineStack(Stack):
         processing_instance_type = ParameterString(
             name="ProcessingInstanceType", default_value="ml.m5.xlarge"
         )
-        # 0.5 AUROC is chance level for a ranking metric -- a gate at 0.5
-        # admits models with no signal. 0.8 requires clear separation between
-        # normal and anomalous reconstruction errors (observed runs on both
-        # synthetic and BCCD data score well above this).
-        min_auroc = ParameterFloat(name="MinAUROC", default_value=0.8)
-        # Gate on balanced accuracy (mean per-class recall): raw accuracy on
-        # the ~90% 'good' distribution lets a majority-class predictor pass
-        # while detecting zero defects. 0.6 requires genuine signal on BOTH
-        # classes (0.5 = chance for a two-class balanced metric).
+        min_auroc = ParameterFloat(
+            name="MinAUROC", default_value=config.DEFAULT_MIN_AUROC
+        )
         min_accuracy = ParameterFloat(name="MinBalancedAccuracy", default_value=0.6)
-        # Balanced accuracy alone can hide weak defect detection: with 10
-        # test defects, perfect good-class recall plus 2/10 defect recall is
-        # (1.0 + 0.2) / 2 = 0.6 -- passing the gate while missing 80% of
-        # defects. The recall gate closes that hole.
         min_defect_recall = ParameterFloat(name="MinDefectRecall", default_value=0.5)
         # Fleet lineage: identifies which camera/device this execution trains.
         # Attached to registered model packages and used by warm-start lookup,
         # so each camera only ever warm-starts from its own model history.
         camera_id = ParameterString(name="CameraId", default_value="default")
-        custom_training_image_uri = (
-            f"{sagemaker_session.account_id()}.dkr.ecr.{concrete_region}.amazonaws.com/"
-            "sm1k-custom-training:latest"
+        pinned_digest = config.training_image_digest(
+            self.node.try_get_context("training_image_digest")
         )
-        # 400 training samples give validation and test splits of 100 each
-        # (quarter-sized, see preprocess_cv.py), i.e. 10 defect images per
-        # split -- enough that a single prediction flip does not swing the
-        # balanced-accuracy gate by whole tenths.
+        repo_uri = (
+            f"{account}.dkr.ecr.{concrete_region}.amazonaws.com/{TRAINING_REPO_NAME}"
+        )
+        custom_training_image_uri = (
+            f"{repo_uri}@{pinned_digest}" if pinned_digest else f"{repo_uri}:latest"
+        )
         num_samples = ParameterInteger(name="NumSamples", default_value=400)
         training_data_s3_uri = ParameterString(name="TrainingDataS3Uri", default_value="none")
 
@@ -353,21 +362,15 @@ class SageMakerCVPipelineStack(Stack):
             return Join(
                 on="/",
                 values=[
-                    f"s3://{bucket_name}/cv-pipeline/runs",
+                    f"s3://{bucket_name}/{RUNS_PREFIX}",
                     ExecutionVariables.PIPELINE_EXECUTION_ID,
                     *suffix,
                 ],
             )
 
-        # 1. Computer Vision Data Preprocessing Steps
         cv_processor = ScriptProcessor(
-            image_uri=image_uris.retrieve(
-                framework="sklearn",
-                region=concrete_region,
-                version="1.2-1",
-                py_version="py3",
-                instance_type="ml.m5.xlarge",
-            ),
+            image_uri=custom_training_image_uri,
+            command=["python3"],
             instance_type=processing_instance_type,
             instance_count=1,  # Use fixed value instead of parameter
             base_job_name="cv-pipeline-preprocess",
@@ -404,7 +407,14 @@ class SageMakerCVPipelineStack(Stack):
                 ),
             ],
             code="src/data/preprocess_cv.py",
-            arguments=["--num-samples", num_samples.to_string(), "--format", "anomalib", "--training-data-s3-uri", training_data_s3_uri],
+            arguments=[
+                "--num-samples", num_samples.to_string(),
+                "--format", "anomalib",
+                "--training-data-s3-uri", training_data_s3_uri,
+                # Processing containers do not receive AWS_REGION automatically;
+                # the real-data path needs it to reach S3.
+                "--region", concrete_region,
+            ],
         )
 
         step_cv_process_anomalib = ProcessingStep(
@@ -413,15 +423,9 @@ class SageMakerCVPipelineStack(Stack):
             cache_config=cache_config,
         )
 
-        # 2. Fetch latest approved models for warm-start retraining
         fetch_processor = ScriptProcessor(
-            image_uri=image_uris.retrieve(
-                framework="sklearn",
-                region=concrete_region,
-                version="1.2-1",
-                py_version="py3",
-                instance_type="ml.m5.xlarge",
-            ),
+            image_uri=custom_training_image_uri,
+            command=["python3"],
             instance_type=processing_instance_type,
             instance_count=1,
             base_job_name="cv-pipeline-fetch-model",
@@ -446,7 +450,7 @@ class SageMakerCVPipelineStack(Stack):
             # pass the pipeline's region explicitly rather than relying on
             # in-container resolution.
             arguments=[
-                "--model-package-group-name", "sm1k-anomaly-model-group",
+                "--model-package-group-name", ANOMALY_MODEL_GROUP,
                 "--region", concrete_region,
                 # Warm-start must only consider this camera's own model
                 # history; without the filter a camera could warm-start from
@@ -477,7 +481,7 @@ class SageMakerCVPipelineStack(Stack):
             ],
             code="src/model/fetch_latest_model.py",
             arguments=[
-                "--model-package-group-name", "sm1k-classifier-model-group",
+                "--model-package-group-name", CLASSIFIER_MODEL_GROUP,
                 "--region", concrete_region,
                 "--camera-id", camera_id,
             ],
@@ -488,7 +492,6 @@ class SageMakerCVPipelineStack(Stack):
             cache_config=cache_config,
         )
 
-        # 3. Anomalib Model Training Step
         anomalib_input_data = [
             InputData(
                 channel_name="train",
@@ -501,13 +504,6 @@ class SageMakerCVPipelineStack(Stack):
                 channel_name="validation",
                 data_source=step_cv_process_anomalib.properties.ProcessingOutputConfig.Outputs[
                     "validation"
-                ].S3Output.S3Uri,
-                content_type="application/x-tar",
-            ),
-            InputData(
-                channel_name="test",
-                data_source=step_cv_process_anomalib.properties.ProcessingOutputConfig.Outputs[
-                    "test"
                 ].S3Output.S3Uri,
                 content_type="application/x-tar",
             ),
@@ -622,11 +618,6 @@ class SageMakerCVPipelineStack(Stack):
             ],
         )
 
-        # --- Register model steps (defined before condition steps so they can be nested) ---
-        # Classifier path: preprocess → fetch → train → eval → quality gate → register
-        # The test channel is deliberately NOT mounted into the classifier
-        # training job: it is reserved in full for the downstream ONNX
-        # quality gate, so no test image can leak into training.
         classifier_input_data = [
             InputData(
                 channel_name="train",
@@ -744,17 +735,6 @@ class SageMakerCVPipelineStack(Stack):
             ],
         )
 
-        # --- Neo compilation steps (nested under the quality gates) ---
-        # Compilation runs automatically for every model that passes its gate,
-        # in the same execution, and registration depends on it: the invariant
-        # is gate -> compile -> register, so only models that compile for the
-        # edge target become Approved packages. Each step mounts the training
-        # artifact, repackages it ONNX-only (Neo rejects tarballs with extra
-        # members), submits the compilation job, and polls it to completion.
-        # NeoTargetDevice selects a named device (jetson_xavier, rasp4b, ...);
-        # its "none" default compiles for the NeoTargetOs/NeoTargetArch
-        # platform instead (TargetDevice and TargetPlatform are mutually
-        # exclusive in the API).
         neo_target_device = ParameterString(name="NeoTargetDevice", default_value="none")
         neo_target_os = ParameterString(name="NeoTargetOs", default_value="LINUX")
         neo_target_arch = ParameterString(name="NeoTargetArch", default_value="X86_64")
@@ -788,6 +768,7 @@ class SageMakerCVPipelineStack(Stack):
                     "--role-arn", role_arn,
                     "--bucket", bucket_name,
                     "--execution-id", ExecutionVariables.PIPELINE_EXECUTION_ID,
+                    "--runs-prefix", RUNS_PREFIX,
                     "--model-type", model_type,
                     "--image-size", image_size,
                     "--camera-id", camera_id,
@@ -837,11 +818,14 @@ class SageMakerCVPipelineStack(Stack):
             name="RegisterAnomalibModel",
             depends_on=[step_compile_anomalib],
             step_args=anomalib_model_builder.register(
-                model_package_group_name="sm1k-anomaly-model-group",
+                model_package_group_name=ANOMALY_MODEL_GROUP,
                 content_types=["application/x-image", "image/png", "image/jpeg"],
                 response_types=["application/json"],
-                inference_instances=["ml.m5.xlarge", "ml.g4dn.xlarge"],
-                transform_instances=["ml.m5.xlarge", "ml.g4dn.xlarge"],
+                # CPU only: docker/training/Dockerfile installs CPU-only PyTorch
+                # wheels, so advertising a GPU instance here would invite readers
+                # to pay for hardware this image cannot use.
+                inference_instances=["ml.m5.xlarge"],
+                transform_instances=["ml.m5.xlarge"],
                 approval_status="Approved",
                 model_metrics=anomalib_metrics,
                 description="Anomalib model package from pipeline training run",
@@ -901,11 +885,14 @@ class SageMakerCVPipelineStack(Stack):
             name="RegisterClassifierModel",
             depends_on=[step_compile_classifier],
             step_args=classifier_model_builder.register(
-                model_package_group_name="sm1k-classifier-model-group",
+                model_package_group_name=CLASSIFIER_MODEL_GROUP,
                 content_types=["application/x-image", "image/png", "image/jpeg"],
                 response_types=["application/json"],
-                inference_instances=["ml.m5.xlarge", "ml.g4dn.xlarge"],
-                transform_instances=["ml.m5.xlarge", "ml.g4dn.xlarge"],
+                # CPU only: docker/training/Dockerfile installs CPU-only PyTorch
+                # wheels, so advertising a GPU instance here would invite readers
+                # to pay for hardware this image cannot use.
+                inference_instances=["ml.m5.xlarge"],
+                transform_instances=["ml.m5.xlarge"],
                 approval_status="Approved",
                 model_metrics=classifier_metrics,
                 description="Classifier model package from pipeline training run",

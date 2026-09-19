@@ -1,13 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
-"""
-Evaluate a classifier ONNX model on the complete test channel.
-The classifier trains exclusively on the train and validation channels
-(see train_classifier.py), so every test image is unseen by construction
-and the quality gate scores the entire split.
-Computes accuracy and writes quality metrics for the pipeline quality gate.
-"""
+'Evaluate a classifier ONNX model on the complete test channel. The classifier trains exclusively on the train and validation channels (see train_classifier.py), so every test image is unseen by construction and the quality gate scores the entire split. Computes accuracy and writes quality metrics for the pipeline quality gate.'
 import argparse
 import json
 import logging
@@ -40,6 +34,22 @@ def load_test_channel(test_root: Path, image_size: int):
         labels.extend([CLASS_NAMES.index(class_name)] * len(class_images))
         logger.info("Test channel: %d '%s' images", len(class_images), class_name)
     return np.concatenate(images).astype(np.float32), np.array(labels, dtype=np.int64)
+
+
+def check_logits(logits, expected_shape):
+    'Refuse unusable ONNX logits before any prediction is derived from them.'
+    if logits.shape != expected_shape:
+        raise ValueError(
+            f"ONNX logits have shape {logits.shape}, expected {expected_shape}. "
+            f"argmax over an unexpected shape would produce predictions that do "
+            f"not correspond to the test images."
+        )
+    if not np.isfinite(logits).all():
+        raise ValueError(
+            f"ONNX logits contain {int((~np.isfinite(logits)).sum())} non-finite "
+            f"value(s). argmax over NaN silently returns class 0, reporting every "
+            f"image as 'good'; refusing to derive predictions from it."
+        )
 
 
 def main():
@@ -82,25 +92,46 @@ def main():
     session = ort.InferenceSession(str(onnx_path))
     input_name = session.get_inputs()[0].name
     logits = session.run(None, {input_name: test_images.astype(np.float32)})[0]
+
+    # Validate the model's output BEFORE deriving predictions. np.argmax over
+    # all-NaN logits returns index 0 without complaint, which silently reports
+    # "every image is good" as though it were a real prediction.
+    check_logits(logits, (len(test_labels), len(CLASS_NAMES)))
+
     preds = np.argmax(logits, axis=1)
 
-    # Balanced accuracy / defect recall alongside accuracy: on the ~90% 'good'
-    # class distribution a majority-class predictor reaches ~0.9 accuracy while
-    # detecting zero defects, so the pipeline quality gate keys on balanced
-    # accuracy (mean per-class recall) instead of raw accuracy.
     accuracy = float(np.mean(preds == test_labels))
     per_class_recall = []
-    for class_idx in range(len(CLASS_NAMES)):
+    support = {}
+    for class_idx, class_name in enumerate(CLASS_NAMES):
         mask = test_labels == class_idx
-        recall = float(np.mean(preds[mask] == class_idx)) if mask.any() else 0.0
-        per_class_recall.append(recall)
+        support[class_name] = int(mask.sum())
+        if not mask.any():
+            raise ValueError(
+                f"Test channel has no '{class_name}' images; per-class recall is "
+                f"undefined. Regenerate the dataset with both classes present."
+            )
+        per_class_recall.append(float(np.mean(preds[mask] == class_idx)))
     balanced_accuracy = float(np.mean(per_class_recall))
     defect_recall = per_class_recall[CLASS_NAMES.index("defect")]
+
+    # Confusion counts make the gated metrics interpretable: balanced accuracy
+    # alone does not say whether a passing model floods the line with false
+    # positives.
+    confusion = {
+        f"true_{actual}_pred_{predicted}": int(
+            np.sum((test_labels == a_idx) & (preds == p_idx))
+        )
+        for a_idx, actual in enumerate(CLASS_NAMES)
+        for p_idx, predicted in enumerate(CLASS_NAMES)
+    }
 
     logger.info(
         "ONNX evaluation: accuracy=%.4f balanced_accuracy=%.4f defect_recall=%.4f (%d samples)",
         accuracy, balanced_accuracy, defect_recall, len(test_images),
     )
+    logger.info("Support: %s", support)
+    logger.info("Confusion: %s", confusion)
 
     # Write metrics
     output_dir = Path(args.output_dir)
@@ -109,10 +140,15 @@ def main():
         "accuracy": accuracy,
         "balanced_accuracy": balanced_accuracy,
         "defect_recall": defect_recall,
+        "good_recall": per_class_recall[CLASS_NAMES.index("good")],
         "num_samples": len(test_images),
+        "support": support,
+        "confusion": confusion,
     }
+    # allow_nan=False: bare NaN/Infinity is not valid JSON and must never reach
+    # the pipeline's numeric quality-gate comparison.
     with open(output_dir / "model_quality_statistics.json", "w") as f:
-        json.dump(metrics, f, indent=2)
+        json.dump(metrics, f, indent=2, allow_nan=False)
 
     print(f"evaluation:accuracy={accuracy:.4f}")
     print(f"evaluation:balanced_accuracy={balanced_accuracy:.4f}")

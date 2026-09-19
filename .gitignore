@@ -28,6 +28,8 @@ build/
 tmp/
 .tmp/
 .tmp*
+.training-image-digest
+/execution*.json
 
 # Notebook noise
 .ipynb_checkpoints/
@@ -38,11 +40,3 @@ tmp/
 
 # OS
 .DS_Store
-
-# Session / agent artifacts
-session_status/
-.kiro/
-SESSION_*_HANDOFF.md
-THOUGHT_LOG.md
-PLAN.md
-SESSION_HANDOFF.md
