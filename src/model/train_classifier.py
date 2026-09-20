@@ -1,13 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
-"""
-Cell classification training script for SageMaker SDK v3.
-Trains a ResNet18 binary classifier (good vs defect) on the same dataset
-used by the anomaly detector -- demonstrating two approaches to the same
-quality inspection task within one pipeline.
-Exports to ONNX for edge deployment via SageMaker Neo.
-"""
+'Cell classification training script for SageMaker SDK v3. Trains a ResNet18 binary classifier (good vs defect) on the same dataset used by the anomaly detector -- demonstrating two approaches to the same quality inspection task within one pipeline. Exports to ONNX for edge deployment via SageMaker Neo.'
 import argparse
 import json
 import logging
@@ -22,7 +16,13 @@ from torch.utils.data import DataLoader, TensorDataset
 from torchvision import models
 
 from utils.tarball import extract_tarballs
+from utils.onnx_export import export_onnx
 from utils.dataset import resolve_dataset_root, load_images, list_images
+from utils.lineage import (
+    load_dataset_manifest,
+    resolve_warm_start,
+    write_training_manifest,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -32,14 +32,7 @@ CLASS_NAMES = ["good", "defect"]
 
 
 def build_model(num_classes: int, pretrained_path: str = None) -> nn.Module:
-    """Build ResNet18 classifier with custom head.
-
-    Starts from ImageNet weights (cached in the training image at build
-    time): from-scratch ResNet18 on the small per-camera datasets memorizes
-    the minority class instead of generalizing (observed: train loss ~0.003
-    with held-out defect recall 0.0). Warm-start weights from a prior
-    pipeline run, when present, override the ImageNet initialization.
-    """
+    'Build ResNet18 classifier with custom head.'
     model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
     model.fc = nn.Linear(model.fc.in_features, num_classes)
     if pretrained_path and Path(pretrained_path).exists():
@@ -71,69 +64,36 @@ def load_labeled_data(data_dir: Path, image_size: int):
     return images, labels, all_files
 
 
-def stratified_split(labels: np.ndarray, train_fraction: float, seed: int):
-    """Return (train_idx, holdout_idx), seeded and stratified per class.
-
-    Stratification matters on the ~90% 'good' distribution: an unstratified
-    draw can leave one side with zero defects.
-    """
-    rng = np.random.default_rng(seed)
-    train_parts, holdout_parts = [], []
-    for class_idx in np.unique(labels):
-        class_indices = np.flatnonzero(labels == class_idx)
-        rng.shuffle(class_indices)
-        split = int(train_fraction * len(class_indices))
-        train_parts.append(class_indices[:split])
-        holdout_parts.append(class_indices[split:])
-    train_idx = np.concatenate(train_parts)
-    holdout_idx = np.concatenate(holdout_parts)
-    rng.shuffle(train_idx)
-    rng.shuffle(holdout_idx)
-    return train_idx, holdout_idx
-
-
-def prepare_classifier_data(train_root: Path, val_root: Path, image_size: int, seed: int):
-    """Build classifier training/holdout arrays from the train and validation
-    channels ONLY.
-
-    The test channel is deliberately not an input to this script (it is not
-    even mounted into the training job): it is reserved, complete and
-    untouched, for the downstream ONNX quality gate. Training data is the
-    train channel's 'good' images plus a stratified 70% of the validation
-    channel (the only training-side source of defect examples); the
-    remaining 30% of validation is held out for the in-training metric.
-    """
+def prepare_classifier_data(train_root: Path, val_root: Path, image_size: int):
+    'Train on the TRAIN split; evaluate on the untouched VALIDATION split.'
+    train_images, train_labels, _ = load_labeled_data(train_root, image_size)
     val_images, val_labels, _ = load_labeled_data(val_root, image_size)
-    if not (val_labels == CLASS_NAMES.index("defect")).any():
-        raise ValueError(
-            f"Validation channel at {val_root} contains no defect images; "
-            "the classifier cannot learn the defect class from it."
-        )
-    train_idx, holdout_idx = stratified_split(val_labels, train_fraction=0.7, seed=seed)
 
-    good_images = load_images(train_root / "good", image_size)
-    good_labels = np.zeros(len(good_images), dtype=np.int64)
+    for split_name, labels, root in (
+        ("train", train_labels, train_root),
+        ("validation", val_labels, val_root),
+    ):
+        missing = [
+            CLASS_NAMES[idx] for idx in range(NUM_CLASSES) if not (labels == idx).any()
+        ]
+        if missing:
+            raise ValueError(
+                f"The {split_name} split at {root} has no {', '.join(missing)} "
+                f"images. The classifier needs both classes in train (to learn) "
+                f"and in validation (to measure per-class recall). Regenerate the "
+                f"dataset with a larger --num-samples or a higher --anomaly-ratio."
+            )
 
-    train_images = np.concatenate([good_images, val_images[train_idx]], axis=0)
-    train_labels = np.concatenate([good_labels, val_labels[train_idx]], axis=0)
-    holdout_images = val_images[holdout_idx]
-    holdout_labels = val_labels[holdout_idx]
     logger.info(
-        "Classifier data: train=%d (defects=%d, %d from train-good, %d from validation) "
-        "holdout=%d (defects=%d), seed=%d",
-        len(train_labels), int(train_labels.sum()), len(good_labels), len(train_idx),
-        len(holdout_labels), int(holdout_labels.sum()), seed,
+        "Classifier data: train=%d (defects=%d) validation=%d (defects=%d)",
+        len(train_labels), int(train_labels.sum()),
+        len(val_labels), int(val_labels.sum()),
     )
-    return train_images, train_labels, holdout_images, holdout_labels
+    return train_images, train_labels, val_images, val_labels
 
 
 def compute_metrics(model: nn.Module, images: np.ndarray, labels: np.ndarray, device: torch.device) -> dict:
-    """Compute accuracy plus defect-sensitive metrics.
-
-    Plain accuracy is misleading on this ~90% 'good' dataset: a
-    majority-class predictor scores ~0.9 while detecting nothing. Balanced
-    accuracy and defect recall expose that failure mode.
-    """
+    'Compute accuracy plus defect-sensitive metrics.'
     model.eval()
     with torch.no_grad():
         x = torch.tensor(images, dtype=torch.float32).to(device)
@@ -143,20 +103,29 @@ def compute_metrics(model: nn.Module, images: np.ndarray, labels: np.ndarray, de
 
 
 def classification_metrics(labels: np.ndarray, preds: np.ndarray) -> dict:
-    """Shared metric computation for numpy label/prediction arrays."""
+    'Shared metric computation for numpy label/prediction arrays.'
     labels = np.asarray(labels)
     preds = np.asarray(preds)
+    if labels.shape != preds.shape:
+        raise ValueError(
+            f"labels and predictions must align, got {labels.shape} and {preds.shape}"
+        )
     accuracy = float(np.mean(preds == labels))
     per_class_recall = []
-    for class_idx in range(NUM_CLASSES):
+    for class_idx, class_name in enumerate(CLASS_NAMES):
         mask = labels == class_idx
-        recall = float(np.mean(preds[mask] == class_idx)) if mask.any() else 0.0
-        per_class_recall.append(recall)
+        if not mask.any():
+            raise ValueError(
+                f"No '{class_name}' examples in the evaluation set; per-class "
+                f"recall is undefined."
+            )
+        per_class_recall.append(float(np.mean(preds[mask] == class_idx)))
     defect_idx = CLASS_NAMES.index("defect")
     return {
         "accuracy": accuracy,
         "balanced_accuracy": float(np.mean(per_class_recall)),
         "defect_recall": per_class_recall[defect_idx],
+        "good_recall": per_class_recall[CLASS_NAMES.index("good")],
     }
 
 
@@ -168,7 +137,12 @@ def main():
     parser.add_argument("--num_epochs", type=int, default=10)
     parser.add_argument("--image_size", type=int, default=224)
     parser.add_argument("--seed", type=int, default=1337,
-                        help="Seed for the train/holdout split and torch init")
+                        help="Seed for torch init and batch sampling")
+    parser.add_argument("--allow_incompatible_warm_start", type=str, default="false",
+                        help="Warm-start even from a parent whose split scheme or "
+                             "preprocessing schema differs. Off by default: such a "
+                             "parent may have been fitted on images this dataset holds "
+                             "out, which makes the gate score not a held-out score.")
     parser.add_argument("--model_dir", type=str, default=os.environ.get("SM_MODEL_DIR", "/opt/ml/model"))
     parser.add_argument("--train", type=str, default=os.environ.get("SM_CHANNEL_TRAIN", "/opt/ml/input/data/train"))
     parser.add_argument("--validation", type=str, default=os.environ.get("SM_CHANNEL_VALIDATION", "/opt/ml/input/data/validation"))
@@ -178,30 +152,52 @@ def main():
     train_dir = extract_tarballs(Path(args.train), "train")
     val_dir = extract_tarballs(Path(args.validation), "validation")
 
-    # Look for pretrained model
+    dataset_manifest = load_dataset_manifest(train_dir, val_dir)
+
+    # Look for a pretrained model, and check it is a valid starting point BEFORE
+    # loading its weights -- see utils/lineage.py for why within-version split
+    # disjointness is not sufficient.
     pretrained_path = None
+    parent_manifest = None
+    forced_warm_start = False
+    use_parent = False
     if args.pretrained_model and Path(args.pretrained_model).exists():
         pretrained_dir = extract_tarballs(Path(args.pretrained_model), "pretrained")
-        pt_files = list(pretrained_dir.rglob("*.pt"))
-        if pt_files:
-            pretrained_path = str(pt_files[0])
+        use_parent, parent_manifest, _, forced_warm_start = resolve_warm_start(
+            dataset_manifest, pretrained_dir, args.image_size,
+            allow_incompatible=str(args.allow_incompatible_warm_start).lower()
+            in ("1", "true", "yes", "on"),
+        )
+        if use_parent:
+            # The checkpoint the compatibility check was performed against, not an
+            # independently chosen one. Selecting the manifest and the weights
+            # separately let a compatible manifest validate incompatible weights.
+            from utils.lineage import find_parent_checkpoint  # noqa: PLC0415
+            bound_checkpoint, _ = find_parent_checkpoint(pretrained_dir)
+            pt_files = [bound_checkpoint] if bound_checkpoint else []
+            if not pt_files:
+                logger.warning(
+                    "Parent artifact has no .pt checkpoint; training from initial "
+                    "weights and recording NO ancestry, even though its manifest "
+                    "was compatible."
+                )
+                use_parent = False
+                forced_warm_start = False
+            if pt_files:
+                pretrained_path = str(pt_files[0])
 
-    train_root = resolve_dataset_root(train_dir, "train", require_defect=False)
+    train_root = resolve_dataset_root(train_dir, "train", require_defect=True)
     val_root = resolve_dataset_root(val_dir, "validation", require_defect=True)
 
-    # Classifier data comes from the train and validation channels only; the
-    # test channel stays untouched for the ONNX quality gate downstream.
-    train_images, train_labels, test_images, test_labels = prepare_classifier_data(
-        train_root, val_root, args.image_size, args.seed
+    # Training data is the train channel; validation is spent only on measuring.
+    # The test channel stays untouched for the ONNX quality gate downstream.
+    train_images, train_labels, val_images, val_labels = prepare_classifier_data(
+        train_root, val_root, args.image_size
     )
 
     torch.manual_seed(args.seed)
     train_x = torch.tensor(train_images, dtype=torch.float32)
     train_y = torch.tensor(train_labels, dtype=torch.int64)
-    # Oversample the minority class so every batch is roughly balanced.
-    # The dataset is ~90% 'good'; with plain shuffling most batches carry
-    # zero defect examples and the model converges to a majority-class
-    # predictor (observed live: accuracy 0.88, defect recall 0.0).
     class_counts = np.bincount(train_labels, minlength=NUM_CLASSES).astype(np.float64)
     sample_weights = torch.tensor(
         [1.0 / max(class_counts[label], 1.0) for label in train_labels],
@@ -240,11 +236,11 @@ def main():
         epoch_loss /= max(1, len(train_loader))
         logger.info("Epoch %d/%d loss=%.4f", epoch + 1, args.num_epochs, epoch_loss)
 
-    # Evaluate
-    eval_metrics = compute_metrics(model, test_images, test_labels, device)
+    # Evaluate on the untouched validation split
+    eval_metrics = compute_metrics(model, val_images, val_labels, device)
     test_accuracy = eval_metrics["accuracy"]
     logger.info(
-        "Held-out eval: accuracy=%.4f balanced_accuracy=%.4f defect_recall=%.4f",
+        "Validation eval: accuracy=%.4f balanced_accuracy=%.4f defect_recall=%.4f",
         eval_metrics["accuracy"],
         eval_metrics["balanced_accuracy"],
         eval_metrics["defect_recall"],
@@ -257,15 +253,7 @@ def main():
     # ONNX export
     dummy = torch.randn(1, 3, args.image_size, args.image_size, dtype=torch.float32)
     onnx_path = os.path.join(args.model_dir, "model.onnx")
-    torch.onnx.export(
-        model_cpu,
-        dummy,
-        onnx_path,
-        input_names=["input"],
-        output_names=["logits"],
-        dynamic_axes={"input": {0: "batch"}, "logits": {0: "batch"}},
-        opset_version=11,
-    )
+    export_onnx(model_cpu, dummy, onnx_path, "logits")
     logger.info("Exported ONNX model to %s", onnx_path)
 
     # PyTorch state dict
@@ -282,6 +270,15 @@ def main():
     }
     with open(os.path.join(args.model_dir, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
+
+    write_training_manifest(
+        args.model_dir, dataset_manifest, args.image_size, args.model_name,
+        # Only weights that were ACTUALLY loaded. Recording a rejected
+        # parent described weights this model never saw, and stopped a
+        # genuine cold start from clearing inherited contamination.
+        parent=parent_manifest if use_parent else None,
+        unsafe_ancestry=forced_warm_start,
+    )
 
     print(f"validation:accuracy={test_accuracy:.4f}")
     print(f"validation:balanced_accuracy={eval_metrics['balanced_accuracy']:.4f}")

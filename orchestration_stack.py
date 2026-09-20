@@ -2,35 +2,13 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
-"""
-Orchestration stack: SQS → Lambda → Step Functions with concurrency control.
+'Orchestration stack: SQS -> Lambda -> Step Functions with concurrency control.'
 
-Allows submitting N camera model training requests while limiting concurrent
-SageMaker pipeline executions to a configurable maximum (default: 5).
-
-Architecture:
-    SQS FIFO Queue
-        → Lambda (poller, triggered by SQS)
-            → Step Functions State Machine
-                → Acquire semaphore (DynamoDB atomic counter)
-                → StartPipelineExecution (SageMaker)
-                → Poll until complete
-                → Release semaphore
-                → SNS notification
-
-Known limitation (sample scope): the semaphore is a shared arithmetic
-counter, and its increment/decrement updates are not idempotent. If a
-DynamoDB update commits but the response is lost, the Step Functions
-retry re-applies the arithmetic -- acquisition can overcount (permanently
-burning a slot until an operator resets ActiveCount) and release can
-undercount (briefly admitting an extra execution). Every such failure is
-surfaced through explicit Fail states rather than hidden. For
-production-strength fleet orchestration, replace the counter with
-per-execution lease records keyed by the state-machine execution ID so
-each acquire/release is idempotent.
-"""
+import sys
+from pathlib import Path
 
 from aws_cdk import (
+    ArnFormat,
     Stack,
     Duration,
     RemovalPolicy,
@@ -39,16 +17,44 @@ from aws_cdk import (
     aws_events_targets as targets,
     aws_sqs as sqs,
     aws_sns as sns,
-    aws_sns_subscriptions as subs,
     aws_dynamodb as dynamodb,
+    aws_iam as iam,
     aws_lambda as _lambda,
     aws_lambda_event_sources as event_sources,
+    aws_logs as logs,
     aws_stepfunctions as sfn,
     aws_stepfunctions_tasks as tasks,
 )
 from constructs import Construct
 
-PIPELINE_NAME = "anomaly-detection-pipeline-e2e-final"
+import config
+
+# The compilation job naming contract, shared with the driver that creates the jobs and
+# the lease manager that inspects them. Imported here so the IAM scope is derived from
+# the same model-type list rather than a third copy of it.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src" / "orchestration"))
+import neo_jobs  # noqa: E402
+
+from config import (
+    RUNS_PREFIX,
+    COMPLETION_TOPIC_NAME,
+    FAILURE_RULE_NAME,
+    OUTPUT_DLQ_URL,
+    OUTPUT_LEASE_FUNCTION_NAME,
+    OUTPUT_LEASE_TABLE_NAME,
+    OUTPUT_QUEUE_TRIGGER_FUNCTION_NAME,
+    OUTPUT_QUEUE_URL,
+    OUTPUT_STATE_MACHINE_ARN,
+    OUTPUT_TOPIC_ARN,
+    PIPELINE_NAME,
+    QUEUE_TRIGGER_FUNCTION_NAME,
+    SEMAPHORE_TABLE_NAME,
+    STATE_MACHINE_NAME,
+    TRAINING_DLQ_NAME,
+    TRAINING_QUEUE_NAME,
+)
+
+LEASE_TABLE_NAME = f"{SEMAPHORE_TABLE_NAME}-leases"
 
 
 class OrchestrationStack(Stack):
@@ -56,46 +62,42 @@ class OrchestrationStack(Stack):
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         max_concurrency = kwargs.pop("max_concurrency", 5)
         pipeline_name = kwargs.pop("pipeline_name", PIPELINE_NAME)
-        # Slot-wait budget: how long an execution polls for a free semaphore
-        # slot before failing as AcquireTimedOut. Size it to your backlog:
-        # worst-case wait is (queued executions / max_concurrency) x average
-        # pipeline runtime. At the default (480 x 30s = 4 hours), cap 5, and
-        # the sample's ~15-minute runtime, roughly 85 queued executions can
-        # start before the rest time out. NOTE (sample scope): every waiting
-        # execution polls DynamoDB on this interval, so a longer bound scales
-        # state-transition cost linearly with backlog size. For sustained
-        # fleet-scale backlogs, keep pending work in SQS and admit executions
-        # only when capacity exists (bounded dispatcher) instead of raising
-        # this bound.
         max_slot_wait_attempts = kwargs.pop("max_slot_wait_attempts", 480)
+        stale_lease_seconds = kwargs.pop("stale_lease_seconds", 6 * 60 * 60)
         super().__init__(scope, construct_id, **kwargs)
 
-        # --- DynamoDB semaphore table ---
-        semaphore_table = dynamodb.Table(
+        # --- DynamoDB lease table ---
+        lease_table = dynamodb.Table(
             self,
-            "SemaphoreTable",
-            table_name="sm1k-pipeline-semaphore",
+            "LeaseTable",
+            table_name=LEASE_TABLE_NAME,
             partition_key=dynamodb.Attribute(
-                name="LockName", type=dynamodb.AttributeType.STRING
+                name="LeaseId", type=dynamodb.AttributeType.STRING
             ),
             billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
             removal_policy=RemovalPolicy.DESTROY,
+            point_in_time_recovery_specification=dynamodb.PointInTimeRecoverySpecification(
+                point_in_time_recovery_enabled=True
+            ),
         )
 
         # --- SQS FIFO queue + DLQ ---
         dlq = sqs.Queue(
             self,
             "TrainingDLQ",
-            queue_name="sm1k-training-requests-dlq.fifo",
+            queue_name=TRAINING_DLQ_NAME,
             fifo=True,
             retention_period=Duration.days(14),
         )
         queue = sqs.Queue(
             self,
             "TrainingQueue",
-            queue_name="sm1k-training-requests.fifo",
+            queue_name=TRAINING_QUEUE_NAME,
             fifo=True,
-            content_based_deduplication=True,
+            # Producer-supplied deduplication IDs (see scripts/submit_batch.py):
+            # content-based dedup would suppress a deliberate retrain of the same
+            # camera with the same parameters inside the 5-minute window.
+            content_based_deduplication=False,
             visibility_timeout=Duration.minutes(15),
             dead_letter_queue=sqs.DeadLetterQueue(max_receive_count=3, queue=dlq),
         )
@@ -104,51 +106,115 @@ class OrchestrationStack(Stack):
         topic = sns.Topic(
             self,
             "CompletionTopic",
-            topic_name="sm1k-pipeline-completions",
+            topic_name=COMPLETION_TOPIC_NAME,
         )
 
-        # --- Step Functions state machine ---
-        # Acquire semaphore: a single atomic conditional increment. The
-        # ConditionExpression enforces the cap inside DynamoDB itself, so
-        # there is no increment-then-check window to undo (the previous
-        # design compared $.semaphore.Attributes.ActiveCount.N in a Choice
-        # state, but DynamoDB returns N as a JSON *string* and ASL numeric
-        # comparisons do not coerce strings -- the over-limit rule never
-        # matched and the cap was silently bypassed).
-        acquire_semaphore = tasks.DynamoUpdateItem(
+        pipeline_arns = [
+            f"arn:aws:sagemaker:{self.region}:{self.account}:pipeline/{pipeline_name}",
+            f"arn:aws:sagemaker:{self.region}:{self.account}:pipeline/{pipeline_name}/*",
+        ]
+
+        lease_fn = _lambda.Function(
             self,
-            "AcquireSemaphore",
-            table=semaphore_table,
-            key={"LockName": tasks.DynamoAttributeValue.from_string("pipeline-concurrency")},
-            update_expression="SET ActiveCount = if_not_exists(ActiveCount, :zero) + :one",
-            condition_expression="attribute_not_exists(ActiveCount) OR ActiveCount < :limit",
-            expression_attribute_values={
-                ":zero": tasks.DynamoAttributeValue.number_from_string("0"),
-                ":one": tasks.DynamoAttributeValue.number_from_string("1"),
-                ":limit": tasks.DynamoAttributeValue.number_from_string(str(max_concurrency)),
+            "LeaseManager",
+            function_name=f"{QUEUE_TRIGGER_FUNCTION_NAME}-lease",
+            runtime=_lambda.Runtime.PYTHON_3_12,
+            handler="lease_handler.handler",
+            code=_lambda.Code.from_asset(
+                "src/orchestration", exclude=["**/__pycache__/**", "**/*.pyc"],
+            ),
+            timeout=Duration.minutes(2),
+            environment={
+                "LEASE_TABLE_NAME": lease_table.table_name,
+                "MAX_CONCURRENCY": str(max_concurrency),
+                "PIPELINE_NAME": pipeline_name,
+                "STALE_LEASE_SECONDS": str(stale_lease_seconds),
+                "RUNS_BUCKET": config.bucket_name(
+                    Stack.of(self).account, Stack.of(self).region
+                ),
+                "RUNS_PREFIX": RUNS_PREFIX,
             },
-            return_values=tasks.DynamoReturnValues.UPDATED_NEW,
-            result_path="$.semaphore",
+            log_group=logs.LogGroup(
+                self,
+                "LeaseManagerLogs",
+                retention=logs.RetentionDays.ONE_MONTH,
+                removal_policy=RemovalPolicy.DESTROY,
+            ),
+        )
+        lease_table.grant_read_write_data(lease_fn)
+        lease_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "sagemaker:DescribePipelineExecution",
+                    "sagemaker:ListPipelineExecutions",
+                ],
+                resources=pipeline_arns,
+            )
+        )
+        lease_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "sagemaker:DescribeCompilationJob",
+                ],
+                resources=[
+                    Stack.of(self).format_arn(
+                        service="sagemaker",
+                        resource="compilation-job",
+                        resource_name=f"neo-{model_type}-*",
+                        arn_format=ArnFormat.SLASH_RESOURCE_NAME,
+                    )
+                    for model_type in neo_jobs.MODEL_TYPES
+                ],
+            )
         )
 
-        # Release semaphore (decrement)
-        release_semaphore = tasks.DynamoUpdateItem(
-            self,
-            "ReleaseSemaphore",
-            table=semaphore_table,
-            key={"LockName": tasks.DynamoAttributeValue.from_string("pipeline-concurrency")},
-            update_expression="SET ActiveCount = ActiveCount - :one",
-            expression_attribute_values={
-                ":one": tasks.DynamoAttributeValue.number_from_string("1"),
-            },
-            result_path=sfn.JsonPath.DISCARD,
+        # Read-only, and scoped to the run prefix. The lease manager only ever reads the
+        # submission records the compilation driver wrote; it does not read or write
+        # anything else in the bucket.
+        lease_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["s3:GetObject"],
+                resources=[
+                    f"arn:{Stack.of(self).partition}:s3:::"
+                    f"{config.bucket_name(Stack.of(self).account, Stack.of(self).region)}"
+                    f"/{RUNS_PREFIX}/*"
+                ],
+            )
         )
 
-        # Over-limit path: the conditional acquire failed, so nothing was
-        # incremented and there is nothing to release -- wait for a slot and
-        # try again. The wait loop is bounded (max_slot_wait_attempts, a
-        # stack prop) so a genuinely stuck fleet fails loudly instead of
-        # spinning forever.
+        lease_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["s3:ListBucket"],
+                resources=[
+                    f"arn:{Stack.of(self).partition}:s3:::"
+                    f"{config.bucket_name(Stack.of(self).account, Stack.of(self).region)}"
+                ],
+                conditions={"StringLike": {"s3:prefix": [f"{RUNS_PREFIX}/*"]}},
+            )
+        )
+
+        def lease_task(name: str, payload: dict, result_path: str) -> tasks.LambdaInvoke:
+            return tasks.LambdaInvoke(
+                self,
+                name,
+                lambda_function=lease_fn,
+                payload=sfn.TaskInput.from_object(payload),
+                # Unwrap the Lambda envelope so downstream Choice states read the
+                # handler's own fields.
+                payload_response_only=True,
+                result_path=result_path,
+            )
+
+        acquire_lease = lease_task(
+            "AcquireLease",
+            {
+                "action": "acquire",
+                "executionName.$": "$$.Execution.Name",
+                "requestId.$": "$.request_id",
+            },
+            "$.lease",
+        )
+
         init_slot_wait = sfn.Pass(
             self,
             "InitSlotWaitCounter",
@@ -169,50 +235,12 @@ class OrchestrationStack(Stack):
         acquire_timed_out = sfn.Fail(
             self,
             "AcquireTimedOut",
-            cause="No semaphore slot became available within the wait bound",
-            error="SemaphoreAcquireTimeout",
+            cause="No lease became available within the wait bound; nothing was acquired",
+            error="LeaseAcquireTimeout",
         )
         check_slot_wait = sfn.Choice(self, "CheckSlotWaitBudget")
-        increment_slot_wait.next(check_slot_wait)
-        check_slot_wait.when(
-            sfn.Condition.number_less_than("$.slotWait.count", max_slot_wait_attempts),
-            wait_for_slot,
-        )
-        check_slot_wait.otherwise(acquire_timed_out)
-        wait_for_slot.next(acquire_semaphore)
 
-        # ConditionalCheckFailedException means the cap is reached -- do not
-        # retry it inline (MaxAttempts=0 routes it straight to the Catch and
-        # the wait loop). Everything else gets transient-fault retries and,
-        # if still failing, also falls into the bounded wait loop: no
-        # semaphore was acquired, so waiting and re-acquiring is always safe.
-        acquire_semaphore.add_retry(
-            errors=["DynamoDB.ConditionalCheckFailedException"],
-            max_attempts=0,
-        )
-        acquire_semaphore.add_retry(
-            errors=["States.ALL"],
-            max_attempts=3,
-            interval=Duration.seconds(2),
-            backoff_rate=2.0,
-        )
-        acquire_semaphore.add_catch(
-            increment_slot_wait,
-            errors=["States.ALL"],
-            result_path="$.acquireError",
-        )
-
-        # Scoped ARNs for the SageMaker pipeline this state machine operates on
-        pipeline_arns = [
-            f"arn:aws:sagemaker:{self.region}:{self.account}:pipeline/{pipeline_name}",
-            f"arn:aws:sagemaker:{self.region}:{self.account}:pipeline/{pipeline_name}/*",
-        ]
-
-        # Generate the idempotency token ONCE per state-machine execution and
-        # store it in the state input. Referencing States.UUID() directly in
-        # the Task would mint a fresh token on every retry attempt, defeating
-        # deduplication; a stored UUID (36 chars, within the API's 32-128
-        # constraint) makes retries of StartPipelineExecution true no-ops.
+        # === Start ============================================================
         generate_client_token = sfn.Pass(
             self,
             "GenerateClientToken",
@@ -220,7 +248,18 @@ class OrchestrationStack(Stack):
             result_path="$.clientToken",
         )
 
-        # Start pipeline execution
+        record_start = lease_task(
+            "RecordStartIntent",
+            {
+                "action": "record_start",
+                "executionName.$": "$$.Execution.Name",
+                "clientToken.$": "$.clientToken.value",
+                "parameters.$": "$.PipelineParameters",
+                "displayName.$": "$$.Execution.Name",
+            },
+            "$.recordStart",
+        )
+
         start_pipeline = tasks.CallAwsService(
             self,
             "StartPipelineExecution",
@@ -230,18 +269,29 @@ class OrchestrationStack(Stack):
                 "PipelineName": pipeline_name,
                 "PipelineParameters": sfn.JsonPath.list_at("$.PipelineParameters"),
                 "ClientRequestToken.$": "$.clientToken.value",
+                "PipelineExecutionDisplayName.$": "$$.Execution.Name",
             },
             iam_resources=pipeline_arns,
             result_path="$.execution",
         )
 
-        # Poll loop: wait → describe → check
+        record_arn = lease_task(
+            "RecordExecutionArn",
+            {
+                "action": "record_start",
+                "executionName.$": "$$.Execution.Name",
+                "clientToken.$": "$.clientToken.value",
+                "executionArn.$": "$.execution.PipelineExecutionArn",
+            },
+            "$.recordArn",
+        )
+
+        # === Poll =============================================================
         wait_poll = sfn.Wait(
             self,
             "WaitBeforePoll",
             time=sfn.WaitTime.duration(Duration.seconds(60)),
         )
-
         describe_execution = tasks.CallAwsService(
             self,
             "DescribePipelineExecution",
@@ -255,12 +305,9 @@ class OrchestrationStack(Stack):
             iam_resources=pipeline_arns,
             result_path="$.status",
         )
-
-        # Bounded poll loop. A state-machine-level timeout cannot be used to
-        # cap runaway executions because timeouts skip Catch handlers and
-        # would leak the semaphore; instead the loop counts iterations and
-        # fails through the normal release path when exhausted.
-        # 240 polls x 60s = 4 hours.
+        # A state-machine-level timeout cannot be used to bound this: timeouts
+        # skip Catch handlers, so the lease would be left behind with no failure
+        # state recording why. The loop counts iterations instead. 240 x 60s = 4h.
         max_poll_attempts = 240
         init_poll_counter = sfn.Pass(
             self,
@@ -274,11 +321,9 @@ class OrchestrationStack(Stack):
             parameters={"count.$": "States.MathAdd($.poll.count, 1)"},
             result_path="$.poll",
         )
-
-        # Check if pipeline is done. Executing AND Stopping are nonterminal:
-        # a Stopping pipeline still consumes resources, so releasing its
-        # semaphore slot early would let a new execution start and exceed
-        # the cap.
+        # Executing AND Stopping are both nonterminal: a Stopping pipeline still
+        # consumes resources, so releasing its lease early would let a new
+        # execution start and exceed the cap.
         is_nonterminal = sfn.Condition.or_(
             sfn.Condition.string_equals("$.status.PipelineExecutionStatus", "Executing"),
             sfn.Condition.string_equals("$.status.PipelineExecutionStatus", "Stopping"),
@@ -289,16 +334,7 @@ class OrchestrationStack(Stack):
         )
         check_status = sfn.Choice(self, "CheckPipelineStatus")
 
-        # Poll loop wiring
-        check_status.when(still_polling, wait_poll)
-        wait_poll.next(describe_execution)
-        describe_execution.next(increment_poll_counter)
-        increment_poll_counter.next(check_status)
-
-        # Poll exhaustion while the pipeline still runs: stop it and wait for
-        # a terminal status BEFORE releasing the semaphore. Releasing while
-        # the pipeline is live would hand its slot to a new execution and
-        # exceed the concurrency cap.
+        # === Stop path ========================================================
         stop_pipeline = tasks.CallAwsService(
             self,
             "StopPipelineExecution",
@@ -313,7 +349,7 @@ class OrchestrationStack(Stack):
             iam_resources=pipeline_arns,
             result_path=sfn.JsonPath.DISCARD,
         )
-        max_stop_wait_attempts = 30  # 30 x 60s = 30 minutes for the stop to land
+        max_stop_wait_attempts = 30  # 30 x 60s
         init_stop_counter = sfn.Pass(
             self,
             "InitStopWaitCounter",
@@ -344,33 +380,20 @@ class OrchestrationStack(Stack):
             iam_resources=pipeline_arns,
             result_path="$.status",
         )
-        # If the pipeline will not stop (or its status cannot be read), fail
-        # WITHOUT releasing: the slot is genuinely still consumed, and
-        # freeing it would break the cap. Operator intervention required.
-        stop_timeout = sfn.Fail(
-            self,
-            "StopTimeoutDetected",
-            cause="Pipeline did not reach a terminal status after StopPipelineExecution;"
-            " semaphore intentionally NOT released -- resolve the execution and"
-            " decrement ActiveCount manually",
-            error="PipelineStopTimeout",
-        )
-        check_stopped = sfn.Choice(self, "CheckStoppedStatus")
-        stop_pipeline.next(init_stop_counter)
-        init_stop_counter.next(wait_for_stop)
-        wait_for_stop.next(describe_after_stop)
-        describe_after_stop.next(increment_stop_counter)
-        increment_stop_counter.next(check_stopped)
-        check_stopped.when(
-            sfn.Condition.and_(
-                is_nonterminal,
-                sfn.Condition.number_less_than("$.stopWait.count", max_stop_wait_attempts),
-            ),
-            wait_for_stop,
-        )
-        check_stopped.when(is_nonterminal, stop_timeout)
 
-        # Notify success
+        # === Release ==========================================================
+        release_lease = lease_task(
+            "ReleaseLease",
+            {"action": "release", "executionName.$": "$$.Execution.Name"},
+            "$.release",
+        )
+        release_lease_on_failure = lease_task(
+            "ReleaseLeaseOnFailure",
+            {"action": "release", "executionName.$": "$$.Execution.Name"},
+            "$.release",
+        )
+
+        # === Terminal states ==================================================
         notify_success = tasks.SnsPublish(
             self,
             "NotifySuccess",
@@ -379,6 +402,7 @@ class OrchestrationStack(Stack):
                 {
                     "status": "SUCCEEDED",
                     "camera_id": sfn.JsonPath.string_at("$.camera_id"),
+                    "request_id": sfn.JsonPath.string_at("$.request_id"),
                     "execution_arn": sfn.JsonPath.string_at(
                         "$.execution.PipelineExecutionArn"
                     ),
@@ -387,78 +411,60 @@ class OrchestrationStack(Stack):
             result_path=sfn.JsonPath.DISCARD,
         )
 
-        # Notify failure
-        notify_failure = tasks.SnsPublish(
+        pipeline_failed = sfn.Fail(
             self,
-            "NotifyFailure",
-            topic=topic,
-            message=sfn.TaskInput.from_object(
-                {
-                    "status": "FAILED",
-                    "camera_id": sfn.JsonPath.string_at("$.camera_id"),
-                    "execution_arn": sfn.JsonPath.string_at(
-                        "$.execution.PipelineExecutionArn"
-                    ),
-                    "pipeline_status": sfn.JsonPath.string_at(
-                        "$.status.PipelineExecutionStatus"
-                    ),
-                }
+            "PipelineFailed",
+            cause_path=sfn.JsonPath.format(
+                "Pipeline execution {} ended with status {}",
+                sfn.JsonPath.string_at("$.execution.PipelineExecutionArn"),
+                sfn.JsonPath.string_at("$.status.PipelineExecutionStatus"),
             ),
-            result_path=sfn.JsonPath.DISCARD,
+            error="PipelineExecutionFailed",
         )
 
-        # Wire the state machine
-        # Success path: release semaphore → notify
-        success_path = release_semaphore.next(notify_success)
-
-        # Failure path: release semaphore copy → notify failure
-        release_on_fail = tasks.DynamoUpdateItem(
+        # Lease deliberately RETAINED. Reaching here means the pipeline's state
+        # could not be established, so freeing the slot could exceed the cap while
+        # the pipeline still runs. The reconciler resolves it against real status.
+        lease_retained = sfn.Fail(
             self,
-            "ReleaseSemaphoreOnFail",
-            table=semaphore_table,
-            key={"LockName": tasks.DynamoAttributeValue.from_string("pipeline-concurrency")},
-            update_expression="SET ActiveCount = ActiveCount - :one",
-            expression_attribute_values={
-                ":one": tasks.DynamoAttributeValue.number_from_string("1"),
-            },
-            result_path=sfn.JsonPath.DISCARD,
+            "LeaseRetainedForReconciliation",
+            cause_path=sfn.JsonPath.format(
+                "Outcome could not be established ({}); the lease is intentionally "
+                "retained and will be resolved by the reconciler against the real "
+                "pipeline status. Cause: {}",
+                sfn.JsonPath.string_at("$.error.Error"),
+                sfn.JsonPath.string_at("$.error.Cause"),
+            ),
+            error="LeaseRetainedPendingReconciliation",
         )
-        failure_path = release_on_fail.next(notify_failure)
-
-        # Error path: release the semaphore when any task between acquire and
-        # release throws (SageMaker API errors, SNS failures, DynamoDB
-        # throttling in the poll loop). Without this, a single task error
-        # terminates the execution with the counter still incremented and
-        # permanently burns one slot of fleet concurrency. The release itself
-        # gets bounded retries; if it still fails, Fail surfaces the leak
-        # loudly instead of dying silently mid-state-machine.
-        release_on_error = tasks.DynamoUpdateItem(
+        stop_budget_exhausted = sfn.Fail(
             self,
-            "ReleaseSemaphoreOnError",
-            table=semaphore_table,
-            key={"LockName": tasks.DynamoAttributeValue.from_string("pipeline-concurrency")},
-            update_expression="SET ActiveCount = ActiveCount - :one",
-            expression_attribute_values={
-                ":one": tasks.DynamoAttributeValue.number_from_string("1"),
-            },
-            result_path=sfn.JsonPath.DISCARD,
+            "StopBudgetExhausted",
+            cause=(
+                "The pipeline was asked to stop and the stop request succeeded, "
+                "but the pipeline did not reach a terminal status within the "
+                "configured stop-wait budget. The lease is intentionally RETAINED: "
+                "the pipeline is demonstrably still consuming resources, so "
+                "freeing the slot could exceed the concurrency cap. The "
+                "reconciler resolves this lease against the real pipeline status; "
+                "for immediate recovery invoke the lease function with "
+                '{"action": "reconcile", "ExecutionName": "<this execution name>"}.'
+            ),
+            error="StopBudgetExhausted",
         )
-        release_on_error.add_retry(
-            errors=["States.ALL"],
-            max_attempts=3,
-            interval=Duration.seconds(2),
-            backoff_rate=2.0,
-        )
-        execution_failed = sfn.Fail(
+        release_failed = sfn.Fail(
             self,
-            "ExecutionFailed",
-            cause="Task error after semaphore acquisition; semaphore released",
-            error="OrchestrationTaskError",
+            "LeaseReleaseFailed",
+            cause_path=sfn.JsonPath.format(
+                "Releasing the lease failed after retries: {}",
+                sfn.JsonPath.string_at("$.error.Cause"),
+            ),
+            error="LeaseReleaseError",
         )
-        release_on_error.next(execution_failed)
 
-        # Transient-fault retries on the AWS API tasks themselves.
-        for task in (start_pipeline, describe_execution, notify_success, notify_failure):
+        # === Retries and catches ==============================================
+        for task in (acquire_lease, record_start, record_arn, release_lease,
+                     release_lease_on_failure, describe_execution, notify_success):
             task.add_retry(
                 errors=["States.ALL"],
                 max_attempts=3,
@@ -466,43 +472,88 @@ class OrchestrationStack(Stack):
                 backoff_rate=2.0,
             )
 
-        # Tasks that error while the semaphore is HELD funnel to the release.
-        # Only pre-release tasks catch here: routing the notify tasks (which
-        # run after release) through it would decrement the counter twice.
-        for task in (start_pipeline, describe_execution):
-            task.add_catch(
-                release_on_error,
-                errors=["States.ALL"],
-                result_path="$.error",
-            )
-
-        # If any release exhausts its retries the slot genuinely leaks; fail
-        # loudly through the same explicit state on every release path so an
-        # operator resets the counter, instead of the execution dying with a
-        # raw DynamoDB task error on some paths and SemaphoreReleaseError on
-        # others.
-        semaphore_leak = sfn.Fail(
-            self,
-            "SemaphoreLeakDetected",
-            cause="Semaphore release failed after retries; reset ActiveCount manually",
-            error="SemaphoreReleaseError",
+        start_pipeline.add_retry(
+            errors=["SageMaker.ThrottlingException"],
+            max_attempts=3,
+            interval=Duration.seconds(5),
+            backoff_rate=2.0,
         )
-        for task in (release_semaphore, release_on_fail):
-            task.add_retry(
-                errors=["States.ALL"],
-                max_attempts=3,
-                interval=Duration.seconds(2),
-                backoff_rate=2.0,
-            )
-        for task in (release_semaphore, release_on_fail, release_on_error):
+
+        record_rejection = lease_task(
+            "RecordStartRejected",
+            {
+                "action": "record_start_rejected",
+                "ExecutionName.$": "$$.Execution.Name",
+                "Error.$": "$.error.Error",
+            },
+            "$.rejection",
+        )
+        record_rejection.next(lease_retained)
+        # If the marking call itself fails, fall back to the retain path: an
+        # unmarked lease is recovered by the operator, which is the safe direction.
+        record_rejection.add_catch(
+            lease_retained, errors=["States.ALL"], result_path="$.markError"
+        )
+
+        record_ambiguity = lease_task(
+            "RecordAmbiguousStart",
+            {
+                "action": "record_ambiguous_attempt",
+                "ExecutionName.$": "$$.Execution.Name",
+            },
+            "$.ambiguity",
+        )
+        record_ambiguity.next(lease_retained)
+        # If the marker cannot be written, still retain: an unmarked lease is
+        # recovered by an operator, which is the safe direction.
+        record_ambiguity.add_catch(
+            lease_retained, errors=["States.ALL"], result_path="$.markError"
+        )
+
+        AUTHORIZATION_REFUSALS = [
+            "SageMaker.AccessDeniedException",
+            "SageMaker.NotAuthorizedException",
+            "SageMaker.UnrecognizedClientException",
+            "SageMaker.ExpiredTokenException",
+            "SageMaker.IncompleteSignatureException",
+            "SageMaker.MalformedHttpRequestException",
+            "SageMaker.OptInRequiredException",
+            "SageMaker.RequestEntityTooLargeException",
+            "SageMaker.UnknownOperationException",
+            "States.Permissions",
+        ]
+        DEFINITIVE_START_REJECTIONS = [
+            "SageMaker.ValidationException",
+            "SageMaker.ValidationErrorException",
+            "SageMaker.ResourceNotFoundException",
+            "SageMaker.ResourceLimitExceededException",
+            "SageMaker.ThrottlingException",
+            *AUTHORIZATION_REFUSALS,
+        ]
+        start_pipeline.add_catch(
+            record_rejection,
+            errors=DEFINITIVE_START_REJECTIONS,
+            result_path="$.error",
+        )
+
+        for task in (record_start, record_arn, describe_execution):
             task.add_catch(
-                semaphore_leak,
-                errors=["States.ALL"],
-                result_path="$.error",
+                lease_retained, errors=["States.ALL"], result_path="$.error"
             )
 
-        # Stop-path task retries. Errors here must NOT route to a release:
-        # the pipeline may still be running, so the slot is still consumed.
+        start_pipeline.add_catch(
+            record_ambiguity, errors=["States.ALL"], result_path="$.error"
+        )
+
+        # A failed acquire acquired nothing, so waiting and retrying is always
+        # safe -- there is no lease to leak.
+        acquire_lease.add_catch(
+            increment_slot_wait, errors=["States.ALL"], result_path="$.acquireError"
+        )
+        for task in (release_lease, release_lease_on_failure):
+            task.add_catch(release_failed, errors=["States.ALL"], result_path="$.error")
+
+        # Stop-path errors must not release: the pipeline may still be running.
         for task in (stop_pipeline, describe_after_stop):
             task.add_retry(
                 errors=["States.ALL"],
@@ -511,62 +562,122 @@ class OrchestrationStack(Stack):
                 backoff_rate=2.0,
             )
             task.add_catch(
-                stop_timeout,
-                errors=["States.ALL"],
-                result_path="$.error",
+                lease_retained, errors=["States.ALL"], result_path="$.error"
             )
 
-        # Terminal states
+        # === Wiring ===========================================================
+        check_acquired = sfn.Choice(self, "CheckLeaseAcquired")
+
+        definition = init_slot_wait.next(acquire_lease)
+        acquire_lease.next(check_acquired)
+
+        check_acquired.when(
+            sfn.Condition.boolean_equals("$.lease.acquired", True),
+            generate_client_token
+            .next(record_start)
+            .next(start_pipeline)
+            .next(record_arn)
+            .next(init_poll_counter)
+            .next(wait_poll),
+        )
+        admission_closed = sfn.Fail(
+            self,
+            "AdmissionClosed",
+            cause=(
+                "Admission is closed for teardown or maintenance; nothing was "
+                "acquired and no pipeline was started. Reopen admission and "
+                "resubmit with a new batch id."
+            ),
+            error="AdmissionClosed",
+        )
+        check_acquired.when(
+            sfn.Condition.string_equals("$.lease.reason", "admission_closed"),
+            admission_closed,
+        )
+        check_acquired.otherwise(increment_slot_wait)
+
+        increment_slot_wait.next(check_slot_wait)
+        check_slot_wait.when(
+            sfn.Condition.number_less_than("$.slotWait.count", max_slot_wait_attempts),
+            wait_for_slot,
+        )
+        check_slot_wait.otherwise(acquire_timed_out)
+        wait_for_slot.next(acquire_lease)
+
+        wait_poll.next(describe_execution)
+        describe_execution.next(increment_poll_counter)
+        increment_poll_counter.next(check_status)
+
+        check_status.when(still_polling, wait_poll)
+        succeeded = sfn.Succeed(self, "Succeeded")
+        lease_retained_after_success = sfn.Succeed(
+            self,
+            "SucceededWithLeaseRetained",
+            comment=(
+                "The pipeline succeeded and was notified, but its concurrency slot is "
+                "still held because a Neo compilation job it created has not finished. "
+                "Reconciliation releases the slot once that child is terminal."
+            ),
+        )
+        check_release = sfn.Choice(self, "CheckLeaseReleased")
+        check_release.when(
+            sfn.Condition.boolean_equals("$.release.released", True),
+            succeeded,
+        )
+        check_release.otherwise(lease_retained_after_success)
+
         check_status.when(
             sfn.Condition.string_equals("$.status.PipelineExecutionStatus", "Succeeded"),
-            success_path,
+            release_lease.next(notify_success).next(check_release),
         )
-        # Poll budget exhausted while the pipeline is still nonterminal
-        # (still_polling above already failed, so reaching this rule means
-        # the counter is spent): stop the pipeline first, then release.
+        # Poll budget exhausted while still nonterminal: stop it and confirm a
+        # terminal status BEFORE releasing.
         check_status.when(is_nonterminal, stop_pipeline)
-        check_status.otherwise(failure_path)
-        # Once the stopped pipeline reaches a terminal status, release the
-        # slot and notify through the normal failure path.
-        check_stopped.otherwise(failure_path)
+        check_status.otherwise(release_lease_on_failure.next(pipeline_failed))
 
-        # Main flow: init wait budget → conditional acquire → mint client
-        # token → start → poll loop. The acquire either succeeds atomically
-        # or lands in the bounded WaitForSlot loop via its Catch; on success
-        # execution proceeds through the token Pass to
-        # StartPipelineExecution.
-        acquire_semaphore.next(
-            generate_client_token.next(
-                start_pipeline.next(init_poll_counter.next(wait_poll))
-            )
+        stop_pipeline.next(init_stop_counter)
+        init_stop_counter.next(wait_for_stop)
+        wait_for_stop.next(describe_after_stop)
+        describe_after_stop.next(increment_stop_counter)
+        check_stopped = sfn.Choice(self, "CheckStoppedStatus")
+        increment_stop_counter.next(check_stopped)
+        check_stopped.when(
+            sfn.Condition.and_(
+                is_nonterminal,
+                sfn.Condition.number_less_than("$.stopWait.count", max_stop_wait_attempts),
+            ),
+            wait_for_stop,
         )
-        definition = init_slot_wait.next(acquire_semaphore)
+        # Will not stop: retain the lease rather than free a slot whose pipeline
+        # is demonstrably still consuming resources. Uses the dedicated Fail state
+        # because $.error is absent on this route.
+        check_stopped.when(is_nonterminal, stop_budget_exhausted)
+        check_stopped.otherwise(release_lease_on_failure)
 
-        # NOTE on the state-machine timeout: a timeout terminates the
-        # execution immediately without running Catch handlers, so it would
-        # still leak the semaphore. The poll loop is instead bounded by
-        # MaxPollAttempts below, which fails through the normal Catch path;
-        # no top-level timeout is set.
         state_machine = sfn.StateMachine(
             self,
             "PipelineOrchestrator",
-            state_machine_name="sm1k-pipeline-orchestrator",
+            state_machine_name=STATE_MACHINE_NAME,
             definition_body=sfn.DefinitionBody.from_chainable(definition),
+            # Retained execution history for the operational questions this
+            # design creates: which leases were retained, and why.
+            logs=sfn.LogOptions(
+                destination=logs.LogGroup(
+                    self,
+                    "OrchestratorLogs",
+                    retention=logs.RetentionDays.ONE_MONTH,
+                    removal_policy=RemovalPolicy.DESTROY,
+                ),
+                level=sfn.LogLevel.ERROR,
+                include_execution_data=False,
+            ),
+            tracing_enabled=True,
         )
 
-        # Operational failure notifications. The in-flow SNS tasks only cover
-        # the normal success/pipeline-failure paths; executions that end in
-        # AcquireTimedOut, ExecutionFailed, StopTimeoutDetected, or
-        # SemaphoreLeakDetected terminate without notifying. Rather than
-        # inserting a publish before every Fail state (which would risk
-        # replacing the original failure with an SNS failure), an EventBridge
-        # rule forwards every FAILED/TIMED_OUT/ABORTED execution -- with its
-        # original error and cause preserved in the event detail -- to the
-        # same completion topic.
         events.Rule(
             self,
             "ExecutionFailureRule",
-            rule_name="sm1k-orchestrator-failures",
+            rule_name=FAILURE_RULE_NAME,
             event_pattern=events.EventPattern(
                 source=["aws.states"],
                 detail_type=["Step Functions Execution Status Change"],
@@ -578,55 +689,87 @@ class OrchestrationStack(Stack):
             targets=[targets.SnsTopic(topic)],
         )
 
-        # --- Lambda: SQS → Step Functions ---
+        reconcile_rule = events.Rule(
+            self,
+            "LeaseReconcileSchedule",
+            rule_name=f"{FAILURE_RULE_NAME}-reconcile",
+            schedule=events.Schedule.rate(Duration.hours(1)),
+        )
+        reconcile_rule.add_target(
+            targets.LambdaFunction(
+                lease_fn,
+                event=events.RuleTargetInput.from_object({"action": "reconcile"}),
+            )
+        )
+        events.Rule(
+            self,
+            "LeaseReconcileOnAbnormalEnd",
+            rule_name=f"{FAILURE_RULE_NAME}-reconcile-now",
+            event_pattern=events.EventPattern(
+                source=["aws.states"],
+                detail_type=["Step Functions Execution Status Change"],
+                detail={
+                    "status": ["FAILED", "TIMED_OUT", "ABORTED"],
+                    "stateMachineArn": [state_machine.state_machine_arn],
+                },
+            ),
+            targets=[
+                targets.LambdaFunction(
+                    lease_fn,
+                    event=events.RuleTargetInput.from_object({
+                        "action": "reconcile",
+                        "ExecutionArn": events.EventField.from_path(
+                            "$.detail.executionArn"
+                        ),
+                    }),
+                )
+            ],
+        )
+
+        # --- Lambda: SQS -> Step Functions ---
         trigger_fn = _lambda.Function(
             self,
             "QueueTrigger",
-            function_name="sm1k-queue-trigger",
+            function_name=QUEUE_TRIGGER_FUNCTION_NAME,
             runtime=_lambda.Runtime.PYTHON_3_12,
-            handler="index.handler",
+            handler="queue_trigger.handler",
+            code=_lambda.Code.from_asset(
+                "src/orchestration", exclude=["**/__pycache__/**", "**/*.pyc"],
+            ),
             timeout=Duration.seconds(30),
             environment={
                 "STATE_MACHINE_ARN": state_machine.state_machine_arn,
             },
-            code=_lambda.Code.from_inline(
-                """
-import json, os, boto3
-
-sfn = boto3.client("stepfunctions")
-STATE_MACHINE_ARN = os.environ["STATE_MACHINE_ARN"]
-
-def handler(event, context):
-    for record in event["Records"]:
-        body = json.loads(record["body"])
-        camera_id = body.get("camera_id", "default")
-        # Build pipeline parameters from message. CameraId is always
-        # forwarded so registry lineage and warm-start isolation work;
-        # an explicit value in the message wins.
-        params = [{"Name": "CameraId", "Value": camera_id}]
-        for k, v in body.get("parameters", {}).items():
-            if k == "CameraId":
-                params[0]["Value"] = str(v)
-                continue
-            params.append({"Name": k, "Value": str(v)})
-        sfn.start_execution(
-            stateMachineArn=STATE_MACHINE_ARN,
-            input=json.dumps({
-                "camera_id": camera_id,
-                "PipelineParameters": params,
-            }),
-        )
-    return {"statusCode": 200}
-"""
+            log_group=logs.LogGroup(
+                self,
+                "QueueTriggerLogs",
+                retention=logs.RetentionDays.ONE_MONTH,
+                removal_policy=RemovalPolicy.DESTROY,
             ),
         )
         state_machine.grant_start_execution(trigger_fn)
+        trigger_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["states:DescribeExecution"],
+                resources=[
+                    f"arn:aws:states:{self.region}:{self.account}:execution:"
+                    f"{STATE_MACHINE_NAME}:*"
+                ],
+            )
+        )
         trigger_fn.add_event_source(
             event_sources.SqsEventSource(queue, batch_size=1)
         )
 
         # --- Outputs ---
-        CfnOutput(self, "QueueUrl", value=queue.queue_url)
-        CfnOutput(self, "DLQUrl", value=dlq.queue_url)
-        CfnOutput(self, "StateMachineArn", value=state_machine.state_machine_arn)
-        CfnOutput(self, "TopicArn", value=topic.topic_arn)
+        CfnOutput(self, OUTPUT_QUEUE_URL, value=queue.queue_url)
+        CfnOutput(self, OUTPUT_DLQ_URL, value=dlq.queue_url)
+        CfnOutput(self, OUTPUT_STATE_MACHINE_ARN, value=state_machine.state_machine_arn)
+        CfnOutput(self, OUTPUT_TOPIC_ARN, value=topic.topic_arn)
+        CfnOutput(self, OUTPUT_LEASE_TABLE_NAME, value=lease_table.table_name)
+        # The recovery runbook in README.md reads these. It previously told readers
+        # to use $LEASE_FUNCTION and $TRIGGER_FUNCTION without any way to obtain
+        # them, so its commands could not be run as written.
+        CfnOutput(self, OUTPUT_LEASE_FUNCTION_NAME, value=lease_fn.function_name)
+        CfnOutput(self, OUTPUT_QUEUE_TRIGGER_FUNCTION_NAME,
+                  value=trigger_fn.function_name)

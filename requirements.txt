@@ -1,13 +1,14 @@
-# CDK stack + pipeline synthesis
-aws-cdk-lib>=2.100.0
-constructs>=10.0.0
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+# Deploy and operate the sample. Use constraints-tested.txt for the tested set.
+aws-cdk-lib>=2.269.0,<3
+constructs>=10.0.0,<11
 sagemaker>=3.0.0,<4
-boto3>=1.26.0
-
-# Scripts + notebooks (data prep, ONNX inference, visualization)
-pillow>=10.0.0
+# Conditional dataset publication requires PutObject IfNoneMatch support.
+boto3>=1.35.2,<2
+pillow>=12.3.0,<13
+# Match the training image's NumPy ABI.
 numpy>=1.24.0,<2
-onnxruntime>=1.16.0
-matplotlib>=3.7.0
-# Safe XML parsing for the BCCD VOC annotations (untrusted third-party data)
-defusedxml>=0.7.1
+onnxruntime>=1.16.0,<2
+matplotlib>=3.7.0,<4
+defusedxml>=0.7.1,<1

@@ -13,6 +13,23 @@ from utils.dataset import resolve_dataset_root, load_images
 from utils.metrics import binary_auc
 
 
+def check_reconstruction(name, recon, source):
+    'Refuse an unusable ONNX reconstruction before any score is derived from it.'
+    if recon.shape != source.shape:
+        raise ValueError(
+            f"ONNX reconstruction for the {name} split has shape {recon.shape}, "
+            f"expected {source.shape}. Subtracting mismatched shapes would "
+            f"broadcast and produce a meaningless error map."
+        )
+    if not np.isfinite(recon).all():
+        raise ValueError(
+            f"ONNX reconstruction for the {name} split contains "
+            f"{int((~np.isfinite(recon)).sum())} non-finite value(s). The model "
+            f"is not producing usable output; refusing to derive an anomaly "
+            f"score from it."
+        )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--image-size", type=int, default=256)
@@ -53,6 +70,14 @@ def main():
 
     good_recon = sess.run([output_name], {input_name: good})[0]
     defect_recon = sess.run([output_name], {input_name: defect})[0]
+
+    # Validate the model's output BEFORE deriving a score from it. See
+    # check_reconstruction for why each condition is fatal.
+    for name, recon, source in (
+        ("good", good_recon, good), ("defect", defect_recon, defect),
+    ):
+        check_reconstruction(name, recon, source)
+
     good_err = np.mean((good_recon - good) ** 2, axis=(1, 2, 3))
     defect_err = np.mean((defect_recon - defect) ** 2, axis=(1, 2, 3))
 
@@ -62,8 +87,10 @@ def main():
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    # allow_nan=False: json.dump would otherwise emit bare NaN/Infinity, which is
+    # not valid JSON and which a downstream numeric comparison could consume.
     with open(out_dir / "metrics.json", "w", encoding="utf-8") as f:
-        json.dump({"image_auroc": image_auroc}, f, indent=2)
+        json.dump({"image_auroc": image_auroc}, f, indent=2, allow_nan=False)
 
     model_quality = {
         "version": 0,
@@ -71,9 +98,16 @@ def main():
         "binary_classification_metrics": {
             "auc": {"value": float(image_auroc)},
         },
+        # Support counts make the AUROC interpretable: the same number means
+        # something different over 8 images than over 800.
+        "support": {
+            "good": int(len(good_err)),
+            "defect": int(len(defect_err)),
+            "total": int(len(scores)),
+        },
     }
     with open(out_dir / "model_quality_statistics.json", "w", encoding="utf-8") as f:
-        json.dump(model_quality, f, indent=2)
+        json.dump(model_quality, f, indent=2, allow_nan=False)
 
     print(f"onnx_eval:image_auroc={image_auroc:.4f}")
 

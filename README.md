@@ -1,244 +1,245 @@
-# Fleet-Scale Computer Vision Training Pipeline with SageMaker SDK v3
+# Fleet Computer Vision Lifecycle with SageMaker SDK v3 and Neo
 
-This sample deploys an end-to-end MLOps pipeline using the **SageMaker Python SDK v3** that trains, evaluates, and registers dual computer vision models (anomaly detection + defect classification) with ONNX export, automated quality gates, and fleet-scale orchestration via AWS Step Functions.
+Train a camera-specific anomaly detector and defect classifier, evaluate both
+models, compile passing models with SageMaker Neo, and register their ONNX
+artifacts in SageMaker Model Registry. The optional fleet extension queues
+camera requests and limits concurrent pipeline executions.
 
-Use this as a companion to the AWS blog post: *Scaling Fleet-Wide Computer Vision Model Lifecycle Management at the Edge with Amazon SageMaker*.
+The core lifecycle is:
 
-## Architecture
+```text
+Preprocess ─┬─ Train autoencoder ─ Evaluate AUROC ─ Gate ─ Neo compile ─ Register
+            └─ Train classifier ─ Evaluate recalls ─ Gate ─ Neo compile ─ Register
+```
 
-![Solution architecture: SQS FIFO queue triggers Lambda, which starts a Step Functions state machine with a DynamoDB semaphore for concurrency control. The state machine launches a 13-step SageMaker Pipeline with parallel entry steps (Preprocess, Fetch Latest Anomaly, Fetch Latest Classifier), dual training branches with ONNX evaluation, quality gates, Neo compilation, and Model Registry registration. Compiled artifacts land in S3. Completions and failures converge on an SNS topic.](assets/architecture.png)
-
-The solution consists of two CDK stacks:
-
-1. **SageMakerCVPipelineStack** -- Defines a SageMaker Pipeline with dual training branches (a convolutional autoencoder for anomaly detection and a ResNet18 defect classifier), per-camera warm-start fetch steps for both branches, ONNX evaluation, quality gates, SageMaker Neo edge compilation, and model registration into the `sm1k-anomaly-model-group` and `sm1k-classifier-model-group` Model Registry groups. Registration depends on compilation, so only models that compile for the edge target become Approved packages.
-2. **OrchestrationStack** -- Provides fleet-scale orchestration via SQS → Lambda → Step Functions with a DynamoDB-based semaphore for concurrency control (default: 5 concurrent pipeline executions). Executions that end in an operational failure state are forwarded to the completion SNS topic by an EventBridge rule, preserving the original error and cause.
+Each branch can warm-start from its camera's latest eligible model. Dataset
+manifests record split identity and model ancestry. All processing and training
+jobs use CPU instances; the default Neo target is Linux x86-64.
 
 ## Prerequisites
 
-- An AWS account with permissions to create SageMaker, Step Functions, Lambda, SQS, SNS, DynamoDB, ECR, and S3 resources
-- [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) configured with credentials
-- [AWS CDK CLI](https://docs.aws.amazon.com/cdk/v2/guide/getting-started.html) version 2.1131.0 or later (`npm install -g aws-cdk`) -- older CLI versions fail with a cloud assembly schema version mismatch against the `aws-cdk-lib` this project installs
-- Python 3.10–3.12 (Python 3.13+ is incompatible with the `numpy<2` constraint in `requirements.txt`; if your default `python3` is newer, create the virtual environment with an explicit interpreter, e.g. `python3.12 -m venv .venv`)
-- Docker
-- Configured AWS credentials are required for `cdk synth` and `cdk deploy` -- the stack resolves your account and region at synthesis time to build the pipeline definition
-- To deploy to a region other than your AWS CLI default, export **all three** region variables before running any `cdk` or `aws sagemaker` command: `AWS_REGION`, `AWS_DEFAULT_REGION`, and `CDK_DEFAULT_REGION`. The CDK CLI reads `CDK_DEFAULT_REGION`, the SageMaker Python SDK uses boto3 which reads `AWS_DEFAULT_REGION`, and the AWS CLI reads `AWS_REGION` -- omitting any one of these causes the pipeline definition to be synthesized with a mismatched role ARN
+- A commercial AWS account and credentials with permission to deploy the
+  resources in the CDK stacks. This sample targets `us-east-2`.
+- AWS CLI v2, Git, Docker with Buildx, Node.js 22+, and AWS CDK CLI 2.1131.0+.
+- Python 3.12 on Linux x86-64 or macOS arm64. The tested constraints do not
+  support Intel macOS or Python 3.13+.
+- SageMaker quotas sufficient for **3 simultaneous `ml.m5.xlarge` processing
+  instances, 2 training instances, and 2 parallel compilation jobs** per
+  pipeline execution. Check both instance-specific and aggregate quotas.
+  A new account may require quota increases before its first run.
 
-## Deployment
+Before running AWS commands, select your profile and Region in the shell you
+will use for this walkthrough. Replace `YOUR_PROFILE` with your AWS CLI profile
+name, and confirm that the identity is the account you intend to use.
+`AWS_PROFILE` also selects credentials for Python and the CDK application.
 
 ```bash
-# 1. Clone the repository
+export AWS_PROFILE=YOUR_PROFILE
+export AWS_REGION=us-east-2
+export AWS_DEFAULT_REGION="$AWS_REGION"
+aws sts get-caller-identity
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+```
+
+Check quotas in that Region:
+
+```bash
+aws service-quotas list-service-quotas --service-code sagemaker --region "$AWS_REGION" \
+  --query "Quotas[?contains(QuotaName,'ml.m5.xlarge for training job') ||
+    contains(QuotaName,'ml.m5.xlarge for processing job') ||
+    contains(QuotaName,'across all training jobs') ||
+    contains(QuotaName,'across all processing jobs') ||
+    contains(QuotaName,'parallel compilation')].[QuotaName,Value,QuotaCode]" \
+  --output table
+```
+
+Use the returned quota codes to request increases through Service Quotas.
+Fleet capacity multiplies these requirements by the configured concurrency.
+
+## Deploy
+
+Continue in the same shell with those environment variables set.
+
+```bash
 git clone https://github.com/aws-samples/sample-sagemaker-fleet-cv-pipeline.git
 cd sample-sagemaker-fleet-cv-pipeline
-
-# 2. Create and activate a virtual environment
-python3 -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.txt -c constraints-tested.txt
 
-# 3. Bootstrap CDK (first time only). The --app override skips app
-#    synthesis, which would otherwise fail here: synthesis validates the
-#    SageMaker execution role against live IAM, and that role is not
-#    created until step 4.
-cdk bootstrap --app "echo skip" aws://ACCOUNT_ID/REGION
+# Bootstrap CDK without synthesizing this application.
+cdk bootstrap --app "" "aws://$ACCOUNT_ID/$AWS_REGION"
 
-# 4. First deploy only: create the execution role, bucket, ECR repository,
-#    and model package groups WITHOUT the pipeline. The SageMaker SDK
-#    validates the execution role against live IAM while building the
-#    pipeline definition, so the role must exist before the full deploy.
-cdk deploy SageMakerCVPipelineStack -c bootstrap=true --require-approval never
+# First deployment: create the role, bucket, repository, and model groups.
+cdk deploy FleetCVPipelineStack -c bootstrap=true --require-approval never
 
-# 5. Deploy both stacks in full (adds the pipeline and orchestration)
-cdk deploy --all --require-approval never
+# Build linux/amd64 and save the digest from this push.
+bash scripts/push_ecr_image.sh --digest-file .training-image-digest
 
-# 6. Build and push the custom training container to ECR
-./scripts/push_ecr_image.sh
+# Add the complete pipeline using that exact image.
+cdk deploy --all --require-approval never \
+  -c "training_image_digest=$(cat .training-image-digest)"
 ```
 
-## Usage
+CDK may briefly report a changeset waiting for review before continuing
+automatically. Wait for the final deployment result. SDK notices about generated
+job names and no jobs being started are expected while constructing the pipeline;
+the run command below starts its jobs.
 
-### Run the pipeline directly
+The first deployment has two phases because SageMaker SDK v3 validates the
+execution role and uploads step code while constructing the pipeline definition.
+Normal `cdk synth` therefore needs working AWS credentials, the deployed role and
+bucket, and permissions including `iam:GetRole`, `iam:SimulatePrincipalPolicy`,
+and S3 writes. Bootstrap synthesis skips definition construction.
+
+Use `bootstrap=true` only for the initial prerequisites or destruction.
+Deploying it over a complete stack removes the pipeline. When changing source,
+rebuild the image and redeploy with its new digest. A digest fixes the deployed
+image; rebuilding from the mutable base image can still produce a different digest.
+
+## Run and verify
 
 ```bash
-aws sagemaker start-pipeline-execution \
-  --pipeline-name anomaly-detection-pipeline-e2e-final
+python scripts/run_pipeline.py
 ```
 
-### Use real data (BCCD blood cell dataset)
-
-The [BCCD dataset](https://github.com/Shenggan/BCCD_Dataset) (MIT license) contains
-364 annotated blood smear microscopy images, originally open-sourced by
-[cosmicad](https://github.com/cosmicad/dataset) and
-[akshaylamba](https://github.com/akshaylamba/all_CELL_data) and reorganized into
-Pascal VOC format by Shenggan. The same dataset is also distributed by
-[Roboflow](https://public.roboflow.com/object-detection/bccd) as public domain.
-The download script maps platelet presence to the "defect" class as an
-illustrative stand-in for a manufacturing defect distribution.
+The helper starts one execution with synthetic data, waits for it, and verifies
+the execution's own steps, both Approved model packages, completed Neo jobs,
+and nonempty compiled artifacts in S3. It saves the evidence in `execution.json`.
+Cloud startup can take several minutes per job; allow up to 90 minutes.
+Wait for this command to finish successfully before continuing to inference or
+the real-data example below.
+If monitoring is interrupted, resume using the ARN printed at startup:
 
 ```bash
-# Download dataset and upload to S3
+python scripts/run_pipeline.py --execution-arn YOUR_EXECUTION_ARN
+```
+
+The registered packages catalog ONNX models, metrics, and camera identity.
+They reference the training container, which has no inference server, so they
+are not ready to deploy to a SageMaker endpoint. Try local ONNX inference:
+
+```bash
+python scripts/inference_demo.py --model-group fleet-cv-anomaly-model-group --type anomalib
+python scripts/inference_demo.py --model-group fleet-cv-classifier-model-group --type classifier
+```
+
+For downstream edge deployment, use the Neo artifact URIs in `execution.json`.
+Linux x86-64 is the validation target; other devices require their own compile
+and device-runtime validation.
+
+## Use real data
+
+The [BCCD dataset](https://github.com/Shenggan/BCCD_Dataset) provides an
+illustrative image dataset. The downloader maps platelet presence to the defect
+class; this is a teaching example, not a medical application.
+
+```bash
 python scripts/download_bccd.py --output-dir ./data/bccd --upload-s3
-
-# Run pipeline with real data
-aws sagemaker start-pipeline-execution \
-  --pipeline-name anomaly-detection-pipeline-e2e-final \
-  --pipeline-parameters '[{"Name":"TrainingDataS3Uri","Value":"s3://amzn-s3-demo-bucket/data"}]'
+DATA_URI=$(python -c 'import json; print(json.load(open("data/bccd/publication_index.json"))["cameras"]["default"]["s3_uri"])')
+python scripts/run_pipeline.py --data-s3-uri "$DATA_URI" --output execution-bccd.json
 ```
 
-### Fleet-scale batch training
+Pass `--upstream-ref COMMIT_SHA` to the downloader to pin the dataset revision.
+It publishes content-addressed datasets with a completion marker. The URI must
+point above the `anomalib/` format directory, within this sample's bucket.
+The publication index supplies that exact URI.
 
-Submit training requests for multiple cameras or devices. Step Functions limits concurrent SageMaker pipeline executions using a DynamoDB semaphore.
+The default `MinAUROC=0.55` is a demonstration floor. Historical BCCD validation
+measured 0.6127 over 52 test images (18 good, 34 defect); this is a small-sample
+point estimate, with no confidence interval. Choose thresholds using your own
+data before using the pattern in an application. Warm-start parents and upstream
+dataset changes can change subsequent results.
+
+Split assignment uses decoded image content so metadata-only changes do not move
+an image between splits. This protects against exact decoded-image duplication;
+it does not detect near-duplicates, related frames, or patient/production-lot
+overlap. Partition those groups before publishing real datasets.
+
+The notebook in `notebooks/` provides an interactive data and inference walkthrough.
+For multiple cameras and concurrency control, continue with [fleet scheduling](docs/fleet.md).
+
+## Pipeline parameters
+
+| Parameter | Default | Purpose |
+| --- | --- | --- |
+| `TrainingInstanceType` / `ProcessingInstanceType` | `ml.m5.xlarge` | CPU job instances |
+| `NumSamples` | `400` | Synthetic training sample count |
+| `MinAUROC` | `0.55` | Anomaly AUROC gate |
+| `MinBalancedAccuracy` | `0.6` | Classifier mean per-class recall gate |
+| `MinDefectRecall` | `0.5` | Classifier defect recall gate |
+| `CameraId` | `default` | Registry identity and warm-start selection |
+| `TrainingDataS3Uri` | `none` | Published dataset prefix; otherwise generate synthetic data |
+| `NeoTargetDevice` | `none` | Named device, overriding platform settings |
+| `NeoTargetOs` / `NeoTargetArch` | `LINUX` / `X86_64` | Compilation platform |
+
+Both classifier gates must pass. A failing branch neither compiles nor registers.
+Parameters can also be passed with AWS CLI `start-pipeline-execution`.
+
+## Test locally
 
 ```bash
-# Train 50 camera models (max 5 concurrent)
-python scripts/submit_batch.py --cameras 50
-
-# Dry run to preview messages
-python scripts/submit_batch.py --cameras 10 --dry-run
+pip install -r requirements-dev.txt -c constraints-tested.txt \
+  --extra-index-url https://download.pytorch.org/whl/cpu
+python -m pytest tests/ -m "not integration" -q
+python scripts/smoke_local.py
 ```
 
-### Inference from Model Registry
+The smoke runs the real preprocessing, training, export, and evaluation scripts.
+Its small default dataset tests handoffs and gate decisions. To require passing
+gates, use `--num-samples 200 --epochs 6 --expect-gate-pass`.
+
+After deploying prerequisites, check the generated pipeline and both stack modes:
 
 ```bash
-# Anomaly detection inference
-python scripts/inference_demo.py \
-  --model-group sm1k-anomaly-model-group --type anomalib
-
-# Defect classifier inference
-python scripts/inference_demo.py \
-  --model-group sm1k-classifier-model-group --type classifier
-
-# In a fleet run, select a specific camera's model (defaults to "default")
-python scripts/inference_demo.py \
-  --model-group sm1k-classifier-model-group --type classifier --camera-id cam-001
+python -m pytest tests/ -m integration -q
+cdk synth -c bootstrap=true -c fleet=true
+cdk synth -c fleet=true \
+  -c "training_image_digest=$(cat .training-image-digest)"
 ```
 
-### Edge compilation with SageMaker Neo
+Local tests cover metrics, split and lineage integrity, exported graphs, stack
+structure, and selected fleet failure paths. A cloud execution is needed to
+validate IAM, managed jobs, Neo compilation, and registration together.
 
-Neo compilation is a pipeline step, not a separate process: after each model
-passes its quality gate, a `CompileAnomalibNeo` / `CompileClassifierNeo` step
-compiles it, and **registration depends on compilation succeeding** (gate →
-compile → register), so every Approved package has a device-ready compiled
-artifact alongside its ONNX. The compile step repackages the training
-artifact ONNX-only (Neo rejects tarballs with extra members), submits the
-compilation job under a deterministic name (retries resume the same job
-instead of orphaning it), and polls to completion. Compiled artifacts land
-under the execution's `neo/` prefix in the pipeline bucket.
+## Destroy
 
-Targets are pipeline parameters: `NeoTargetDevice` (e.g. `jetson_xavier`,
-`rasp4b`) selects a named device; its default `none` compiles for the
-`NeoTargetOs`/`NeoTargetArch` platform (default: LINUX/X86_64, which runs on
-any x86_64 Linux host via the bundled
-[DLR runtime](https://github.com/neo-ai/neo-ai-dlr)). The exported models use
-a dynamic batch axis; Neo requires concrete input shapes, so batch size 1 is
-pinned at compilation time (`{"input": [1, 3, 256, 256]}` for the autoencoder,
-`[1, 3, 224, 224]` for the classifier). Compilation jobs are free -- you pay
-only for the S3 storage of the compiled artifacts.
+Stop submitting work and let active executions finish. Cleanup permanently
+deletes registered model versions; stack destruction deletes the artifact bucket
+(including object versions and datasets) and every image in the training
+repository. Copy any results you want to retain first.
 
-To compile an already-registered model for additional device targets after
-the fact (for example, a new device type joins the fleet), use the ad-hoc
-script:
+Use the same environment and activated virtual environment as deployment:
 
 ```bash
-python scripts/compile_neo.py \
-  --model-group sm1k-classifier-model-group --type classifier \
-  --target-device jetson_xavier --camera-id cam-001 --region us-east-2
+python scripts/cleanup.py --dry-run
+python scripts/cleanup.py && \
+  cdk destroy --all -c bootstrap=true -c fleet=true --force
+python scripts/cleanup.py --verify-deleted
 ```
 
-## Pipeline Parameters
+This works with the core stack alone or with fleet scheduling enabled. For a
+fleet deployment, cleanup first closes admission and disables queue consumption;
+it refuses to delete while leases, queued work, pipeline executions, or Neo jobs
+remain. See [fleet recovery](docs/fleet.md#recovery-and-cleanup) if it reports
+retained work. Admission remains closed until explicitly reopened.
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `TrainingInstanceType` | `ml.m5.xlarge` | Instance type for training jobs |
-| `ProcessingInstanceType` | `ml.m5.xlarge` | Instance type for processing jobs |
-| `NumSamples` | `400` | Number of synthetic training samples (validation/test are a quarter of this) |
-| `MinAUROC` | `0.8` | Anomaly detection quality gate threshold (0.5 = chance) |
-| `MinBalancedAccuracy` | `0.6` | Classifier quality gate on balanced accuracy (mean per-class recall); 0.5 = chance |
-| `MinDefectRecall` | `0.5` | Classifier quality gate on defect recall -- balanced accuracy alone can pass a model that detects few defects when good-class recall is perfect; both gates must pass |
-| `CameraId` | `default` | Fleet device identity: tagged on registered models and used to scope warm-start retrieval |
-| `TrainingDataS3Uri` | `none` | S3 URI for real training data (bypasses synthetic generation). Must point at the pipeline's own bucket (as `download_bccd.py --upload-s3` does): the execution role is scoped to that bucket, so external buckets fail with AccessDenied unless you extend the role policy |
-| `NeoTargetDevice` | `none` | Named Neo device target (e.g. `jetson_xavier`, `rasp4b`). When set, overrides the OS/arch platform target |
-| `NeoTargetOs` | `LINUX` | Neo TargetPlatform OS, used when `NeoTargetDevice` is `none` |
-| `NeoTargetArch` | `X86_64` | Neo TargetPlatform architecture, used when `NeoTargetDevice` is `none` |
+Verification checks that both sample stacks, the S3 bucket, ECR repository, and
+model groups are absent. The shared `CDKToolkit` bootstrap resources and
+SageMaker job history/logs remain. No endpoint or other always-on compute is
+created by this sample.
 
-## Project Structure
+## Cost and scope
 
-```
-├── app.py                              # CDK app entry point
-├── sagemaker_cv_pipeline_stack.py      # SageMaker Pipeline definition (SDK v3)
-├── orchestration_stack.py              # Step Functions + SQS orchestration
-├── docker/training/
-│   ├── Dockerfile                      # Custom BYOC training container
-│   └── entrypoint.py                   # Hyperparameter dispatch entrypoint
-├── src/
-│   ├── data/preprocess_cv.py           # Data preprocessing (anomalib format)
-│   ├── model/
-│   │   ├── train_anomalib.py           # Autoencoder anomaly detection training
-│   │   ├── train_classifier.py         # ResNet18 defect classifier training
-│   │   ├── evaluate_anomalib_onnx.py   # ONNX anomaly model evaluation
-│   │   ├── evaluate_classifier_onnx.py # ONNX classifier evaluation
-│   │   ├── compile_neo_step.py         # In-pipeline Neo compilation step
-│   │   └── fetch_latest_model.py       # Model Registry warm-start fetch
-│   └── utils/                          # Shared helpers (tarball, dataset, metrics)
-├── scripts/
-│   ├── download_bccd.py                # Download BCCD dataset + S3 upload
-│   ├── compile_neo.py                  # Ad-hoc Neo compilation (extra targets)
-│   ├── submit_batch.py                 # Submit batch training to SQS
-│   ├── inference_demo.py               # ONNX inference from Model Registry
-│   └── push_ecr_image.sh               # Build + push Docker image to ECR
-└── notebooks/
-    └── inference_demo.ipynb            # Interactive inference walkthrough
-```
+Charges come from processing/training time, Neo compilation, storage, and optional
+fleet service requests. Use current Regional prices and your execution's job
+durations to estimate cost; startup and minimum billing can matter more than
+training time for small examples. There are no always-on instances by default.
 
-## Cost Estimate
+This is a deployable sample for commercial AWS Regions. Review the IAM policies
+before adapting it: ECR pulls and data access are scoped to sample resources,
+while some service actions require `"*"` resources. The execution role includes
+EC2 network-interface permissions for SageMaker's role validation.
 
-Running this sample incurs AWS charges. Key cost drivers:
-
-| Resource | Approximate Cost |
-|----------|-----------------|
-| SageMaker training (ml.m5.xlarge, two jobs, ~5 min combined at default NumSamples) | ~$0.02 per pipeline run |
-| SageMaker processing (ml.m5.xlarge, seven jobs including the two Neo compile drivers at ~4 min each) | ~$0.05 per pipeline run |
-| Neo compilation jobs | free (the driving processing jobs above are the cost) |
-| S3 storage (training data + model + compiled artifacts) | < $0.10/month |
-| Step Functions, Lambda, SQS, DynamoDB, SNS, EventBridge | < $0.10/month (free tier eligible) |
-
-A single pipeline run with synthetic data costs about **$0.07** in compute: 18.9 measured billed instance-minutes of ml.m5.xlarge at ~$0.23/hour on-demand (us-east-2, July 2026), plus small S3/orchestration charges (measured end-to-end runtime ~15 minutes for all 13 steps; steps overlap across the two branches). Fleet-scale runs scale linearly with execution count. Use the [AWS Pricing Calculator](https://calculator.aws/) for estimates in your Region.
-
-## Cleanup
-
-```bash
-# 1. Remove model packages from the registry (created at pipeline runtime,
-#    so CloudFormation cannot delete them). Include --region if deploying
-#    to a non-default region.
-REGION="${AWS_REGION:-us-east-1}"
-
-aws sagemaker list-model-packages --model-package-group-name sm1k-anomaly-model-group \
-  --region "$REGION" --query 'ModelPackageSummaryList[].ModelPackageArn' --output text | \
-  xargs -I {} aws sagemaker delete-model-package --model-package-name {} --region "$REGION"
-
-aws sagemaker list-model-packages --model-package-group-name sm1k-classifier-model-group \
-  --region "$REGION" --query 'ModelPackageSummaryList[].ModelPackageArn' --output text | \
-  xargs -I {} aws sagemaker delete-model-package --model-package-name {} --region "$REGION"
-
-# 2. Destroy both CDK stacks. Pass -c bootstrap=true so synthesis does not
-#    rebuild the pipeline definition (which would fail once the execution
-#    role validation runs against a role the destroy is about to remove).
-cdk destroy --all -c bootstrap=true --force
-```
-
-## Sample Scope Notes
-
-> **Backlog scaling:** the Lambda starts a state-machine execution per queued message immediately, so a large submission becomes many executions polling the semaphore rather than a backlog held in SQS. The slot-wait budget is a stack prop (`max_slot_wait_attempts`, default 480 x 30s = 4 hours); size it as (queued executions / max_concurrency) x average pipeline runtime. Each waiting execution polls on that interval, so state-transition cost grows with backlog size. For sustained fleet-scale backlogs, keep pending work in SQS and admit executions only when capacity exists (a bounded dispatcher) instead of raising the bound.
-
-> **Semaphore limitation:** the concurrency semaphore is a shared DynamoDB counter, and its increment/decrement updates are not idempotent under ambiguous retries -- if an update commits but the response is lost, the Step Functions retry re-applies the arithmetic, which can overcount an acquire (burning a slot until an operator resets `ActiveCount`) or undercount a release. Failures surface through explicit `SemaphoreLeakDetected` / `StopTimeoutDetected` states rather than silently. For production use, replace the counter with per-execution lease records keyed by the state-machine execution ID so acquire and release are idempotent.
-
-> **Model Registry scope:** the pipeline registers models as an artifact catalog -- each package version carries the ONNX artifact, evaluation metrics, and `CameraId` lineage metadata for fleet tracking and warm-start retrieval. Registration only happens after Neo compilation succeeds, so a compiled artifact for the configured target always exists. The registered packages are not directly deployable to SageMaker real-time endpoints or batch transform -- the referenced container is the training image and does not implement a `/ping` / `/invocations` inference server. For edge deployment, use the compiled Neo artifact, or download the ONNX artifact from the package (see `scripts/inference_demo.py` and the notebook) and serve it with ONNX Runtime.
-
-## Security
-
-The SageMaker execution role uses least-privilege inline policies scoped to the S3 bucket, ECR repository, and model package groups this sample deploys, plus the SageMaker training/processing job and CloudWatch Logs permissions those jobs require (job and log ARNs are account- and region-scoped but not name-scoped, since job names are generated at runtime). Review the IAM policies in `sagemaker_cv_pipeline_stack.py` and `orchestration_stack.py` before deploying to production.
-
-See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for reporting security issues.
-
-## License
-
-This library is licensed under the MIT-0 License. See the [LICENSE](LICENSE) file.
+See [CONTRIBUTING](CONTRIBUTING.md) for security issue reporting.
+This project is licensed under [MIT-0](LICENSE).

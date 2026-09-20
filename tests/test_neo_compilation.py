@@ -1,21 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
-"""Regression tests for the in-pipeline Neo compilation step.
-
-Two layers:
-
-1. Pure unit tests on src/model/compile_neo_step.py helpers -- deterministic
-   job naming, TargetDevice/TargetPlatform mutual exclusion, and resume-on-
-   retry handling. These run everywhere.
-
-2. Structure assertions on the generated pipeline definition -- the compile
-   steps sit under the passing gate branches, registration depends on
-   compilation, and the Neo parameters exist. Generating the definition
-   makes the SageMaker SDK v3 validate the execution role against live IAM,
-   so these tests require AWS credentials and the deployed bootstrap role;
-   they skip cleanly otherwise (same constraint as deploying the stack).
-"""
+'Regression tests for the in-pipeline Neo compilation step.'
 import json
 import sys
 from pathlib import Path
@@ -25,6 +11,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src" / "model"))
+
+from config import (  # noqa: E402
+    ANOMALY_MODEL_GROUP,
+    CLASSIFIER_MODEL_GROUP,
+    PIPELINE_STACK_NAME,
+)
 
 import compile_neo_step  # noqa: E402
 
@@ -99,35 +91,95 @@ class TestSubmitOrResume:
             compile_neo_step.submit_or_resume(sm, "job", {"RoleArn": "arn"})
 
 
-def _aws_reachable():
+def _aws_identity():
+    'Return (account, region) from live credentials, or None if unavailable.'
     try:
-        import boto3
+        from aws_env import AwsEnvError, resolve_env
+    except ImportError:
+        return None
 
-        boto3.client("sts").get_caller_identity()
-        return True
-    except Exception:
-        return False
+    from botocore.exceptions import (  # noqa: PLC0415
+        NoCredentialsError,
+        NoRegionError,
+        PartialCredentialsError,
+        ProfileNotFound,
+    )
+
+    absent_causes = (NoRegionError, NoCredentialsError, PartialCredentialsError,
+                     ProfileNotFound)
+    try:
+        return resolve_env()
+    except AwsEnvError as exc:
+        cause = exc.__cause__ or exc.__context__
+        if isinstance(cause, absent_causes):
+            return None
+        if cause is None and "could not be resolved" in str(exc).lower():
+            return None
+        raise
+
+
+@pytest.fixture(scope="module")
+def pipeline_template():
+    'The synthesized template in BOOTSTRAP mode.'
+    aws_cdk = pytest.importorskip("aws_cdk")
+    from sagemaker_cv_pipeline_stack import SageMakerCVPipelineStack
+
+    app = aws_cdk.App(context={"bootstrap": "true"})
+    SageMakerCVPipelineStack(
+        app,
+        PIPELINE_STACK_NAME,
+        env=aws_cdk.Environment(account="111111111111", region="us-east-1"),
+    )
+    return app.synth().get_stack_by_name(PIPELINE_STACK_NAME).template
+
+
+def test_bootstrap_creates_deletable_prerequisites_without_a_pipeline(pipeline_template):
+    resources = list(pipeline_template["Resources"].values())
+    types = [resource["Type"] for resource in resources]
+    assert "AWS::SageMaker::Pipeline" not in types
+    assert types.count("AWS::SageMaker::ModelPackageGroup") == 2
+    for resource in resources:
+        if resource["Type"] in ("AWS::S3::Bucket", "AWS::ECR::Repository"):
+            assert resource["DeletionPolicy"] == "Delete"
+        if resource["Type"] == "AWS::ECR::Repository":
+            assert resource["Properties"]["EmptyOnDelete"] is True
+
+
+@pytest.mark.parametrize("fleet,expected_count", [("false", 1), ("true", 2)])
+def test_fleet_stack_is_optional(tmp_path, fleet, expected_count):
+    from app import build_app
+
+    app = build_app("111111111111", "us-east-1",
+                    context={"bootstrap": "true", "fleet": fleet}, outdir=str(tmp_path))
+    assert len(app.synth().stacks) == expected_count
 
 
 @pytest.fixture(scope="module")
 def pipeline_steps():
-    if not _aws_reachable():
-        pytest.skip("pipeline definition generation requires AWS credentials "
-                    "(SDK v3 validates the execution role against live IAM)")
+    identity = _aws_identity()
+    if identity is None:
+        pytest.skip(
+            "pipeline definition generation requires AWS credentials and a "
+            "resolvable region (SDK v3 validates the execution role against "
+            "live IAM and uploads step code to S3)"
+        )
+    account, region = identity
     aws_cdk = pytest.importorskip("aws_cdk")
     from sagemaker_cv_pipeline_stack import SageMakerCVPipelineStack
 
     app = aws_cdk.App()
-    try:
-        stack = SageMakerCVPipelineStack(app, "SageMakerCVPipelineStack")
-    except Exception as exc:  # noqa: BLE001 -- bootstrap role absent
-        pytest.skip(f"pipeline definition unavailable in this account: {exc}")
+    stack = SageMakerCVPipelineStack(
+        app,
+        PIPELINE_STACK_NAME,
+        env=aws_cdk.Environment(account=account, region=region),
+    )
     definition = json.loads(
         stack.pipeline.pipeline_definition["PipelineDefinitionBody"]
     )
     return {step["Name"]: step for step in definition["Steps"]}, definition
 
 
+@pytest.mark.integration
 def test_compile_steps_nested_under_passing_gates(pipeline_steps):
     steps, _ = pipeline_steps
     for gate, compile_name in (
@@ -138,6 +190,7 @@ def test_compile_steps_nested_under_passing_gates(pipeline_steps):
         assert compile_name in if_names
 
 
+@pytest.mark.integration
 def test_registration_depends_on_compilation(pipeline_steps):
     steps, _ = pipeline_steps
     for gate, compile_name, register_prefix in (
@@ -151,12 +204,14 @@ def test_registration_depends_on_compilation(pipeline_steps):
         assert compile_name in depends
 
 
+@pytest.mark.integration
 def test_neo_parameters_present(pipeline_steps):
     _, definition = pipeline_steps
     names = {p["Name"] for p in definition["Parameters"]}
     assert {"NeoTargetDevice", "NeoTargetOs", "NeoTargetArch"} <= names
 
 
+@pytest.mark.integration
 def test_classifier_warm_start_wiring(pipeline_steps):
     steps, _ = pipeline_steps
     assert "FetchLatestClassifierModel" in steps
@@ -166,7 +221,7 @@ def test_classifier_warm_start_wiring(pipeline_steps):
             "ContainerArguments"
         ]
     )
-    assert "sm1k-classifier-model-group" in fetch_args
+    assert CLASSIFIER_MODEL_GROUP in fetch_args
     assert "--camera-id" in fetch_args
 
     train = steps["TrainClassifierModel"]
@@ -177,11 +232,12 @@ def test_classifier_warm_start_wiring(pipeline_steps):
     assert "FetchLatestClassifierModel" in train.get("DependsOn", [])
 
 
+@pytest.mark.integration
 def test_both_fetch_steps_filter_by_camera(pipeline_steps):
     steps, _ = pipeline_steps
     for name, group in (
-        ("FetchLatestAnomalibModel", "sm1k-anomaly-model-group"),
-        ("FetchLatestClassifierModel", "sm1k-classifier-model-group"),
+        ("FetchLatestAnomalibModel", ANOMALY_MODEL_GROUP),
+        ("FetchLatestClassifierModel", CLASSIFIER_MODEL_GROUP),
     ):
         args = steps[name]["Arguments"]["AppSpecification"]["ContainerArguments"]
         joined = " ".join(str(a) for a in args)
@@ -189,6 +245,7 @@ def test_both_fetch_steps_filter_by_camera(pipeline_steps):
         assert "--camera-id" in joined
 
 
+@pytest.mark.integration
 def test_compile_step_shapes_and_region(pipeline_steps):
     steps, _ = pipeline_steps
     for gate, name, size in (
@@ -201,3 +258,23 @@ def test_compile_step_shapes_and_region(pipeline_steps):
         assert "--image-size" in joined
         assert size == joined[joined.index("--image-size") + 1]
         assert "--target-device" in joined
+
+
+PULL_ACTIONS = frozenset({
+    "ecr:BatchCheckLayerAvailability",
+    "ecr:BatchGetImage",
+    "ecr:GetDownloadUrlForLayer",
+})
+METRIC_NAMESPACES = frozenset({
+    "/aws/sagemaker/TrainingJobs",
+    "/aws/sagemaker/ProcessingJobs",
+})
+
+
+IAM_ASSERTIONS = (
+    "test_the_execution_role_uses_only_policy_forms_these_tests_can_evaluate",
+    "test_ecr_pull_is_scoped_to_the_training_repository",
+    "test_no_statement_grants_a_wildcard_action_over_the_protected_actions",
+    "test_put_metric_data_is_confined_by_namespace",
+    "test_the_namespace_condition_survives_a_request_without_context",
+)

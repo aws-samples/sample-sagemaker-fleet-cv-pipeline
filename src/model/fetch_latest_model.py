@@ -10,15 +10,18 @@ from pathlib import Path
 import boto3
 
 
-def find_latest_for_camera(sm, group_name: str, camera_id: str):
-    """Return (arn, description) of the newest approved package whose
-    CameraId metadata matches, or (None, None).
+def eligible_or_none(desc: dict):
+    'Return *desc* if the package is safe to consume, else None.'
+    return (
+        desc
+        if desc.get("ModelApprovalStatus") == "Approved"
+        and desc.get("ModelPackageStatus") == "Completed"
+        else None
+    )
 
-    ListModelPackages cannot filter on customer metadata, so walk the
-    newest-first pages and describe candidates until one matches. Without
-    this filter every camera would warm-start from whichever camera
-    registered most recently.
-    """
+
+def find_latest_for_camera(sm, group_name: str, camera_id: str):
+    'Return (arn, description) of the newest approved package whose CameraId metadata matches, or (None, None).'
     paginator = sm.get_paginator("list_model_packages")
     pages = paginator.paginate(
         ModelPackageGroupName=group_name,
@@ -32,8 +35,19 @@ def find_latest_for_camera(sm, group_name: str, camera_id: str):
                 ModelPackageName=summary["ModelPackageArn"]
             )
             metadata = desc.get("CustomerMetadataProperties", {})
-            if metadata.get("CameraId") == camera_id:
-                return summary["ModelPackageArn"], desc
+            if metadata.get("CameraId") != camera_id:
+                continue
+            if eligible_or_none(desc) is None:
+                # Approval can change between the list page and this read, so the
+                # list filter alone is not sufficient. Warm-starting from a
+                # rejected parent would carry its weights into a new model.
+                print(
+                    f"Skipping {summary['ModelPackageArn']}: approval="
+                    f"{desc.get('ModelApprovalStatus')!r} status="
+                    f"{desc.get('ModelPackageStatus')!r}"
+                )
+                continue
+            return summary["ModelPackageArn"], desc
     return None, None
 
 
