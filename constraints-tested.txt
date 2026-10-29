@@ -98,7 +98,7 @@ orderly-set==5.5.0
 packaging==26.3
 pandas==3.0.5
 paramiko==5.0.0
-pillow==12.3.0
+pillow==13.0.0
 platformdirs==4.11.8
 pluggy==1.6.0
 prettytable==3.18.0

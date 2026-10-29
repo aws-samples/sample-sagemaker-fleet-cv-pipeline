@@ -6,7 +6,7 @@ constructs>=10.0.0,<11
 sagemaker>=3.0.0,<4
 # Conditional dataset publication requires PutObject IfNoneMatch support.
 boto3>=1.35.2,<2
-pillow>=12.3.0,<13
+pillow>=13.0.0,<14
 # Match the training image's NumPy ABI.
 numpy>=1.24.0,<2
 onnxruntime>=1.16.0,<2
